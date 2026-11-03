@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from freetoken.engine import EngineConfig
+from freetoken.utils.mp import zmq_addr
 
 
 def _get_pid_suffix() -> str:
@@ -24,15 +25,15 @@ class SchedulerConfig(EngineConfig):
 
     @property
     def zmq_backend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_0" + self._unique_suffix
+        return zmq_addr(0, self._unique_suffix)
 
     @property
     def zmq_detokenizer_addr(self) -> str:
-        return "ipc:///tmp/freetoken_1" + self._unique_suffix
+        return zmq_addr(1, self._unique_suffix)
 
     @property
     def zmq_scheduler_broadcast_addr(self) -> str:
-        return "ipc:///tmp/freetoken_2" + self._unique_suffix
+        return zmq_addr(2, self._unique_suffix)
 
     @property
     def max_forward_len(self) -> int:
@@ -41,3 +42,5 @@ class SchedulerConfig(EngineConfig):
     @property
     def backend_create_detokenizer_link(self) -> bool:
         return True
+
+

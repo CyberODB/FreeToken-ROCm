@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import os
+import sys
 import pathlib
 import re
 from functools import cache
@@ -106,6 +107,8 @@ def _rocm_link_flags() -> List[str]:
     still links with ``-lamdhip64``. Supply a cache-local unversioned symlink via
     an explicit linker search path without modifying the Python environment.
     """
+    if sys.platform == "win32":  # tvm_ffi links amdhip64.lib itself on Windows
+        return []
     candidates: list[pathlib.Path] = []
     if os.getenv("ROCM_HOME"):
         candidates.append(pathlib.Path(os.environ["ROCM_HOME"]))

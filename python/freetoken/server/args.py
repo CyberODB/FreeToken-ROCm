@@ -11,6 +11,7 @@ from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
 from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
+from freetoken.utils.mp import zmq_addr
 
 logger = init_logger(__name__)
 
@@ -44,7 +45,7 @@ class ServerArgs(SchedulerConfig):
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
     # The workers read it to leave the shell's foreground process group, so the ^C that cancels
-    # a turn cannot also kill the engine — see server/launch.py:_detach_process_group.
+    # a turn cannot also kill the engine â€” see server/launch.py:_detach_process_group.
     shell_mode: bool = False
     served_model_name: str | None = None
     tool_call_parser: str = "llama3"
@@ -80,13 +81,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return zmq_addr(3, self._unique_suffix)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = zmq_addr(4, self._unique_suffix)
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -1070,3 +1071,5 @@ def parse_args(
     result = ServerArgs(**kwargs)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
+
+
