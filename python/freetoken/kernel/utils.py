@@ -53,8 +53,7 @@ def _is_rocm_build() -> bool:
 
 DEFAULT_CUDA_CFLAGS = (
     ["-std=c++20", "-O3"]
-    if _is_hip_toolchain()
-    if _is_rocm_build()
+    if (_is_hip_toolchain() or _is_rocm_build())
     else ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 )
 DEFAULT_LDFLAGS = []

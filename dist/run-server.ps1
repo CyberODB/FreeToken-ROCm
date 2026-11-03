@@ -142,7 +142,6 @@ set PATH=$RocmPath\bin;%PATH%
 set "CC=$RocmPath\lib\llvm\bin\clang-cl.exe"
 cd /d %TEMP%
 "$ft" serve --model "$Model" --port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
-"$ft" serve --model-path "$Model" --port $Port $($ExtraArgs -join ' ') > "$LogDir\serve.log" 2> "$LogDir\serve_err.log"
 "@
 $runner = Join-Path $env:TEMP "freetoken_serve.cmd"
 Set-Content $runner $cmd -Encoding ASCII

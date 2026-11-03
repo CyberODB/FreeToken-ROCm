@@ -20,7 +20,10 @@ _TOKENIZER_ARCH = {"gemma4": "gemma4_text", "gpt-oss": "gpt2", "qwen35moe": "qwe
 
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
-    from transformers.integrations.ggml import convert_gguf_tokenizer
+    try:  # patched: transformers>=5.2x moved it
+        from transformers.integrations.gguf import convert_gguf_tokenizer
+    except ImportError:
+        from transformers.integrations.ggml import convert_gguf_tokenizer
 
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
@@ -30,6 +33,12 @@ def load_gguf_tokenizer(model_path: str):
         for k, v in meta.items()
         if k.startswith("tokenizer.ggml.")
     }
+    try:  # patched: new transformers API keys the builder off tokenizer_dict['tokenizer_type']
+        from transformers.integrations.gguf import get_gguf_tokenizer
+
+        conv_arch, tok_dict, _special = get_gguf_tokenizer(model_path)
+    except ImportError:
+        pass
     fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
 
     tokens = tok_dict["tokens"]

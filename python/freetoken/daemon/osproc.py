@@ -19,6 +19,17 @@ def pid_alive(pid: int) -> bool:
     ESRCH → gone, EPERM → exists but not ours (still alive)."""
     if pid <= 0:
         return False
+    if os.name == "nt":  # patched: os.kill(pid, 0) TERMINATES the process on Windows
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() == 5 or ctypes.windll.kernel32.GetLastError() == 5
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -118,6 +129,11 @@ def signal_group(pid: int, sig: int) -> None:
     (the group-leader invariant of our own spawn) before ``killpg``; on any mismatch or lookup
     failure it falls back to signalling just the pid, so a re-adopted process with an unexpected
     group is never able to make us nuke an innocent group."""
+    if os.name == "nt":  # patched: kill the whole tree via taskkill
+        import subprocess
+
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        return
     pgid = proc_pgid(pid)
     try:
         if pgid is not None and pgid == pid:

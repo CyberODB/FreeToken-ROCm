@@ -25,18 +25,29 @@ class SingleInstance:
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
-
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.name == "nt":  # patched: Windows has no fcntl; lock byte 0 with msvcrt
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             os.close(fd)
             raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode())
-        os.fsync(fd)
+        if os.name == "nt":
+            # byte 0 is locked; write the pid after it
+            os.lseek(fd, 1, os.SEEK_SET)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        else:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+            os.fsync(fd)
         self._fd = fd
 
     def release(self) -> None:
