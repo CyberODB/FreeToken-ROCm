@@ -5,6 +5,8 @@ setlocal
 set "REPO=E:\freetoken-rocm"
 set "SRC=E:\freetoken-021"
 set "PYTHONPATH=%SRC%\python"
+set "FREETOKEN_ROCM_ARCH=gfx1201"
+set "CPATH=%REPO%\.venv\Lib\site-packages\_rocm_sdk_devel\include"
 set "ROCM=%REPO%\.venv\Lib\site-packages\_rocm_sdk_core"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>&1
 set "HIP_PATH=%ROCM%"
@@ -16,7 +18,7 @@ set "TRITON_OVERRIDE_ARCH=gfx1201"
 set "ROCM_SDK_TARGET_FAMILY=gfx1201"
 set "HIP_DEVICE_LIB_PATH=%ROCM%\lib\llvm\amdgcn\bitcode"
 set "TVM_FFI_CACHE_DIR=%SRC%\.tvm-ffi-cache"
-set "PATH=%ROCM%\bin;%REPO%\.venv\Scripts;%PATH%"
+set "PATH=%ROCM%\bin;%REPO%\.venv\Lib\site-packages\_rocm_sdk_libraries\bin;%REPO%\.venv\Scripts;%PATH%"
 set "CC=%ROCM%\lib\llvm\bin\clang-cl.exe"
 set "ARGS=%*"
 if /i "%~1"=="serve" (
