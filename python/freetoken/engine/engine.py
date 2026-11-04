@@ -409,6 +409,11 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
+        if torch.version.hip:  # patched: ROCm/Windows (torch 2.15 nightly, HIP 7.16, gfx1201)
+            # after an AOTriton SDPA call (flash or mem-efficient) the next non-AOTriton kernel
+            # fails with hipErrorInvalidValue, so every vision encoder must use the math backend
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
 
         from freetoken.gpu_select import bind_assigned_gpu
 

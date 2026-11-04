@@ -125,7 +125,13 @@ def build_serve_command(
     """The serve invocation + its log path. ``python -m freetoken.cli serve`` (NOT ``-m
     freetoken``, which is a direct-server entrypoint that ignores subcommand argv) so it uses the
     daemon's own interpreter/venv with no PATH dependency."""
-    argv = [python, "-m", "freetoken.cli", "serve", "--model", model, "--port", str(port), *args]
+    # ROCm/gfx1201 fork: MoE kernels crash inside CUDA graphs, so graphs default to off. Step up with
+    # FT_GRAPH_MAX_BS=1,2,4. Placed before *args so an explicit flag from the app still wins.
+    graph_bs = os.environ.get("FT_GRAPH_MAX_BS", "0")
+    argv = [python, "-m", "freetoken.cli", "serve", "--model", model, "--port", str(port),
+            "--cuda-graph-max-bs", graph_bs, *args]
+    # Diagnostic 2026-11-03: FT_EXTRA_SERVE_ARGS (space-separated) goes last, so it overrides the app's flags
+    argv += os.environ.get("FT_EXTRA_SERVE_ARGS", "").split()
     log_path = os.path.join(log_dir, f"serve-{port}.log")
     return argv, log_path
 

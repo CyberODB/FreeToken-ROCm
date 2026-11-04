@@ -67,7 +67,7 @@ def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts:
 def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None):
     """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``."""
     from freetoken.moe.expert_banks import ExpertBanks
-    from freetoken.moe.host_banks import HostBank, PinPipeline
+    from freetoken.moe.host_banks import HostBank, PinPipeline, backing_for
 
     index = gguf_tensor_index(model_path)
     scaled = has_expert_scales({name: info.ggml_type for name, info in index.items()})
@@ -97,9 +97,10 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
             if device is None:
-                host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype), "down": HostBank(tuple(d.shape), d.dtype)}
+                backing = backing_for(layer)
+                host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype, backing=backing), "down": HostBank(tuple(d.shape), d.dtype, backing=backing)}
                 if scaled:
-                    host["global"] = HostBank((experts, 4), torch.float32)
+                    host["global"] = HostBank((experts, 4), torch.float32, backing=backing)
                 banks = {role: bank.tensor for role, bank in host.items()}
             else:
                 banks = {

@@ -274,6 +274,16 @@ class _ResidencyPlan:
 _requested_residency: _ResidencyPlan | None = None
 
 
+def backing_for(layer_id: int) -> str | None:
+    """Per-layer backing under a split plan, like ftw.py's ``_backing``: with ``FREETOKEN_BANK_CUDA_ALLOC`` on,
+    PINNED layers are born pinned ("cuda") and the rest stay mmap. ``None`` (HostBank's default) without a split plan.
+    ROCm fork 2026-11-03: GGUF hybrid otherwise falls back to mmap + hipHostRegister for every layer."""
+    plan = _requested_residency
+    if plan is None or not plan.has_unpinned or not _env_born_pinned() or not 0 <= layer_id < len(plan.labels):
+        return None
+    return "cuda" if plan.labels[layer_id] == HostResidency.PINNED.value else "mmap"
+
+
 @contextlib.contextmanager
 def requested_residency(labels: list[str] | None):
     """Install the ambient per-layer residency plan for the enclosed bank load (``None`` = no plan, everything pins)."""

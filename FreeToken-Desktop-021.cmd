@@ -19,6 +19,24 @@ set "TVM_FFI_CACHE_DIR=%SRC%\.tvm-ffi-cache"
 set "PATH=%ROCM%\bin;%REPO%\.venv\Lib\site-packages\_rocm_sdk_libraries\bin;%REPO%\.venv\Scripts;%PATH%"
 set "CC=%ROCM%\lib\llvm\bin\clang-cl.exe"
 set "FREETOKEN_FT_BIN=%SRC%\bin\ft.cmd"
+rem CUDA graph ladder for the daemon: 0 = off, then 1, 2, 4. See serve_manager.py.
+set "FT_GRAPH_MAX_BS=0"
+rem Diagnostic 2026-11-03: serialize kernels so a GPU fault names the real kernel. Slow; remove after.
+rem Off since 2026-11-03 22:41 (hybrid works); remove "rem " to turn back on for debugging.
+rem set "AMD_SERIALIZE_KERNEL=3"
+rem set "FT_DEBUG_GLU=1"
+rem Diagnostic 2026-11-03: check prefill MoE GEMM inputs (ids, view, MMQ zero tail) before launch.
+rem set "FT_DEBUG_MMQ=1"
+rem 2026-11-03: hybrid. auto + a fixed pin budget picks the split from the budget (no pin probe), so the
+rem PINNED layers can be born pinned (host_banks.backing_for). 12 GiB = the code's 40%-of-RAM WDDM rule.
+set "FT_EXTRA_SERVE_ARGS=--moe-cpu-layers auto"
+set "FREETOKEN_PIN_BUDGET_GB=12"
+rem Diagnostic 2026-11-03 A/B: expert banks born pinned (hipHostMalloc), not mmap + hipHostRegister. Remove after.
+set "FREETOKEN_BANK_CUDA_ALLOC=1"
+rem Measurement 2026-11-03: per-phase decode timing, logged as [hybrid-timing] every 16 steps in serve-1919.log.
+rem Slows decode (syncs the GPU around every phase, overlap off). Off since 2026-11-03 23:35; remove "rem " on both lines to turn back on.
+rem set "FREETOKEN_HYBRID_TIMING=16"
+rem set "FREETOKEN_HYBRID_OVERLAP=0"
 powershell -NoProfile -ExecutionPolicy Bypass -File "E:\freetoken-rocm\guard-daemon.ps1" -Build "TEST" || exit /b 1
 rem freetoken-desktop-test.exe is a patched copy (orange tray icon, "FreeToken TEST" label) made by
 rem E:\freetoken-rocm\patch_tray.py. It gets no app updates: re-run the patch after updating FreeToken Desktop.

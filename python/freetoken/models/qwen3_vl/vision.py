@@ -46,12 +46,20 @@ _warned_rope_fallback = False
 
 
 def _sdpa(q, k, v):
-    # ROCm/Windows: the mem-efficient SDPA backend raises hipErrorInvalidValue; flash and math work
+    # patched: ROCm/Windows: flash and mem-efficient (AOTriton) leave the next kernel failing with
+    # hipErrorInvalidValue, so use math only; it holds an S x S score matrix per head, so run a few
+    # heads at a time (16 heads at 8192 tokens peaked at 9.5 GiB in one call)
     if torch.version.hip:
         from torch.nn.attention import SDPBackend, sdpa_kernel
 
-        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
-            return F.scaled_dot_product_attention(q, k, v)
+        with sdpa_kernel([SDPBackend.MATH]):
+            return torch.cat(
+                [
+                    F.scaled_dot_product_attention(qh, kh, vh)
+                    for qh, kh, vh in zip(q.split(4, dim=1), k.split(4, dim=1), v.split(4, dim=1))
+                ],
+                dim=1,
+            )
     return F.scaled_dot_product_attention(q, k, v)
 
 

@@ -590,7 +590,7 @@ def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
     G, _ = _fused_plan(*probs.shape, probs.device, force_single)
     try:
         return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single)
-    except RuntimeError as exc:
+    except (RuntimeError, AssertionError) as exc:  # ROCm triton raises AssertionError when cooperativeLaunch is missing
         if force_single or G == 1 or not _is_cooperative_launch_error(exc):
             raise
         _COOPERATIVE_DISABLED.add(key)
