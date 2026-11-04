@@ -1,0 +1,12 @@
+0
+new log after 62s
+timing lines: 3
+4:[2026-11-03|23:09:20|FrontendAPI] INFO     Default sampling config (source=model): temperature=1.0, top_k=20, top_p=0.949999988079071
+39:[2026-11-03|23:12:48] INFO     reasoning-effort profile: supported=['high', 'low', 'max', 'medium', 'minimal', 'none', 'xhigh'] default=None
+45:[2026-11-03|23:13:08|core|rank=0] INFO     [hybrid-timing] 16 steps, 907.0 ms/step: hybrid pinned: CPU MoE (serial): 421.4 ms (46%); CPU-only layers: CPU MoE: 231.7 ms (26%); hybrid pinned: CPU submit: 130.0 ms (14%); between MoE layers (attention, norms, router): 85.2 ms (9%); hybrid pinned: PCIe fetch: 12.7 ms (1%); hybrid pinned: GPU expert GEMM: 12.0 ms (1%); hybrid pinned: ensure/routing split: 9.7 ms (1%); outside MoE layers (step tail, sampling, scheduler): 4.3 ms (0%) | per step: steps at bs=1=16, CPU-only layers=12.0, CPU-only layer routes=96.0, hybrid pinned layers=28.0, hybrid pinned CPU routes=0.0, hybrid pinned GPU routes=224.0
+46:[2026-11-03|23:13:18|core|rank=0] INFO     [hybrid-timing] 16 steps, 623.4 ms/step: hybrid pinned: CPU MoE (serial): 264.4 ms (42%); CPU-only layers: CPU MoE: 163.1 ms (26%); between MoE layers (attention, norms, router): 92.4 ms (15%); hybrid pinned: CPU submit: 66.5 ms (11%); hybrid pinned: GPU expert GEMM: 12.1 ms (2%); hybrid pinned: PCIe fetch: 10.1 ms (2%); hybrid pinned: ensure/routing split: 9.9 ms (2%); outside MoE layers (step tail, sampling, scheduler): 4.8 ms (1%) | per step: steps at bs=1=16, CPU-only layers=12.0, CPU-only layer routes=96.0, hybrid pinned layers=28.0, hybrid pinned CPU routes=0.0, hybrid pinned GPU routes=224.0
+48:[2026-11-03|23:13:28|core|rank=0] INFO     [hybrid-timing] 16 steps, 623.5 ms/step: hybrid pinned: CPU MoE (serial): 259.5 ms (42%); CPU-only layers: CPU MoE: 156.7 ms (25%); between MoE layers (attention, norms, router): 92.4 ms (15%); hybrid pinned: CPU submit: 79.6 ms (13%); hybrid pinned: GPU expert GEMM: 12.2 ms (2%); hybrid pinned: ensure/routing split: 10.0 ms (2%); hybrid pinned: PCIe fetch: 8.2 ms (1%); outside MoE layers (step tail, sampling, scheduler): 4.8 ms (1%) | per step: steps at bs=1=16, CPU-only layers=12.0, CPU-only layer routes=96.0, hybrid pinned layers=28.0, hybrid pinned CPU routes=0.0, hybrid pinned GPU routes=224.0
+---
+throughput (token/s): 1.03, #queue-req: 0
+
+[exited with code 0]

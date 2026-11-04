@@ -25,6 +25,95 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# FT_DEBUG_GLU=1 (diagnostic, 2026-11-03): sync after each decode stage of the first decode
+# layers and print the stage first, so the last line before a GPU fault names the stage.
+_DEBUG_SYNC = bool(os.environ.get("FT_DEBUG_GLU"))
+_debug_sync_left = 400
+
+# FREETOKEN_HYBRID_TIMING=N (measurement, 2026-11-03): sync the GPU around each decode MoE phase
+# and log ms/step per phase every N decode steps. Serializes the GPU, so compare shares, not
+# speed; pair with FREETOKEN_HYBRID_OVERLAP=0 so the CPU work lands in its own bucket. Off by default.
+_HYBRID_TIMING = int(os.getenv("FREETOKEN_HYBRID_TIMING", "0") or 0)
+
+
+class _PhaseTimer:
+    """Each mark adds the time since the previous mark to a bucket. Steps start at the first MoE layer."""
+
+    _IDLE_S = 2.0  # a longer gap before a step's first layer is idle time or a prefill: dropped
+
+    def __init__(self, every: int) -> None:
+        import time
+
+        from freetoken.utils import init_logger
+
+        self._clock = time.perf_counter
+        self._log = init_logger(__name__)
+        self.every = every
+        self.first_layer: int | None = None
+        self._reset()
+        self.last: float | None = None
+
+    def _reset(self) -> None:
+        self.buckets: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self.steps = 0
+
+    def active(self) -> bool:
+        return not torch.cuda.is_current_stream_capturing()
+
+    def mark(self, bucket: str) -> None:
+        torch.cuda.synchronize()
+        now = self._clock()
+        if self.last is not None:
+            self.buckets[bucket] = self.buckets.get(bucket, 0.0) + now - self.last
+        self.last = now
+
+    def count(self, key: str, n: int) -> None:
+        self.counts[key] = self.counts.get(key, 0) + n
+
+    def layer_start(self, layer_id: int, bs: int) -> None:
+        if self.first_layer is None:
+            self.first_layer = layer_id
+        if layer_id != self.first_layer:
+            self.mark("between MoE layers (attention, norms, router)")
+            return
+        torch.cuda.synchronize()
+        if self.last is not None and self._clock() - self.last > self._IDLE_S:
+            self.last = None  # idle or prefill since the last step
+        self.mark("outside MoE layers (step tail, sampling, scheduler)")
+        if self.steps >= self.every:
+            self.flush()
+        self.steps += 1
+        self.count(f"steps at bs={bs}", 1)
+
+    def flush(self) -> None:
+        n = max(self.steps, 1)
+        total = sum(self.buckets.values())
+        rows = sorted(self.buckets.items(), key=lambda kv: -kv[1])
+        parts = "; ".join(f"{k}: {1e3 * v / n:.1f} ms ({100 * v / total:.0f}%)" for k, v in rows) if total else "-"
+        counts = ", ".join(f"{k}={v / n:.1f}" if not k.startswith("steps") else f"{k}={v}" for k, v in self.counts.items())
+        self._log.info(f"[hybrid-timing] {n} steps, {1e3 * total / n:.1f} ms/step: {parts} | per step: {counts}")
+        self._reset()
+
+
+_timer = _PhaseTimer(_HYBRID_TIMING) if _HYBRID_TIMING > 0 else None
+
+
+def _debug_sync(stage: str, layer_id: int) -> None:
+    global _debug_sync_left
+    if not _DEBUG_SYNC or _debug_sync_left <= 0 or torch.cuda.is_current_stream_capturing():
+        return
+    _debug_sync_left -= 1
+    import time
+    t0 = time.perf_counter()
+    print(f"[sync-debug] {time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} layer={layer_id} stage={stage}", flush=True)
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        print(f"[sync-debug] GPU FAULT surfaced at layer={layer_id} stage={stage} after {time.perf_counter() - t0:.3f}s", flush=True)
+        raise
+    print(f"[sync-debug]   sync took {time.perf_counter() - t0:.3f}s", flush=True)
+
 
 class MoELayer(BaseOP):
     """Resident routed experts.
@@ -228,12 +317,14 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
+        _debug_sync("decode_start(attn+router done)", self.layer_id)
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        _debug_sync("after_fused_topk", self.layer_id)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -275,15 +366,29 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        timer = _timer if _timer is not None and _timer.active() else None
+        if timer is not None:
+            timer.layer_start(self.layer_id, hidden_states.shape[0])
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
-            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+            out = executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+            if timer is not None:
+                timer.mark("CPU-only layers: CPU MoE")
+                timer.count("CPU-only layers", 1)
+                timer.count("CPU-only layer routes", int((topk_ids >= 0).sum()))
+            return out
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids, timer)
+        if timer is not None:
+            timer.count("plain GPU layers", 1)
         cache.ensure_experts(self.layer_id, topk_ids)
+        if timer is not None:
+            timer.mark("plain layers: ensure_experts")
         cache.copy_missing()
-        return self._expert_gemm(
+        if timer is not None:
+            timer.mark("plain layers: PCIe fetch")
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -293,6 +398,9 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if timer is not None:
+            timer.mark("plain layers: GPU expert GEMM")
+        return out
 
     def _decode_hybrid(
         self,
@@ -300,6 +408,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        timer: "_PhaseTimer | None" = None,
     ) -> torch.Tensor:
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
@@ -319,15 +428,34 @@ class OffloadMoELayer(MoELayer):
         # with several quants this holds only because the cache zeroes its staging area after prefill
         clamp = not self.skips_inactive_slots
         gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
+        _debug_sync("after_ensure_experts_hybrid", self.layer_id)
+        kind = "locked" if self.layer_id in cache.locked_hybrid else "pinned"
+        if timer is not None:
+            timer.mark(f"hybrid {kind}: ensure/routing split")
+            timer.count(f"hybrid {kind} layers", 1)
+            timer.count(f"hybrid {kind} CPU routes", int((cpu_ids >= 0).sum()))
+            timer.count(f"hybrid {kind} GPU routes", int((gpu_w != 0).sum()))
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
+        _debug_sync("after_cpu_decode_submit", self.layer_id)
+        if timer is not None:
+            timer.mark(f"hybrid {kind}: CPU submit")
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
+        # FT_DEBUG_GLU: while the debug checkpoints run, finish the CPU work first so a fault can be pinned on it
+        overlap = _HYBRID_OVERLAP and not (_DEBUG_SYNC and _debug_sync_left > 0)
         cpu_routed_early = (
-            executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
+            executor.decode_sync(pending) if not overlap else None
         )
+        if not overlap:
+            _debug_sync("after_cpu_decode_sync_early", self.layer_id)
+            if timer is not None:
+                timer.mark(f"hybrid {kind}: CPU MoE (serial)")
 
         cache.copy_missing()
+        _debug_sync("after_copy_missing", self.layer_id)
+        if timer is not None:
+            timer.mark(f"hybrid {kind}: PCIe fetch")
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -338,9 +466,16 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
-        if not _HYBRID_OVERLAP:
+        _debug_sync("after_gpu_expert_gemm", self.layer_id)
+        if timer is not None:
+            timer.mark(f"hybrid {kind}: GPU expert GEMM")
+        if not overlap:
             return gpu_routed + cpu_routed_early
-        return executor.decode_sync(pending, add_to=gpu_routed)
+        out = executor.decode_sync(pending, add_to=gpu_routed)
+        _debug_sync("after_cpu_decode_sync", self.layer_id)
+        if timer is not None:
+            timer.mark(f"hybrid {kind}: CPU wait (not hidden)")
+        return out
 
     def _prefill_routed(
         self,

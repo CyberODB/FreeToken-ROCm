@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import math
 
 import torch
@@ -114,6 +115,8 @@ class GgmlMoEKernel(MoEKernel):
 
         def mul_mat_id(w: torch.Tensor, ggml_type: int, a: torch.Tensor) -> torch.Tensor:
             if is_quantized(ggml_type):
+                if os.environ.get("FT_DEBUG_MMQ"):
+                    _debug_mmq_inputs(w, ggml_type, a, ids, is_prefill)
                 return ggml.mul_mat_id(w, ggml_type, a, ids)
             return float_mul_mat_id(w, a, ids, topk_weights, config)
 
@@ -125,7 +128,13 @@ class GgmlMoEKernel(MoEKernel):
         small = x.shape[0] <= min(ggml.mmvq_max_tokens(t) for t in (gate_up_type, down_type) if is_quantized(t))
         if glu is not None and small and is_quantized(gate_up_type):
             gu = (None, None) if gate_up_scales is None else (gate_up_scales[:, 0], gate_up_scales[:, 1])
+            if os.environ.get("FT_DEBUG_GLU"):
+                _debug_glu_inputs(gate_up, gate_up_type, x, ids)
             inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu, *gu)
+            if os.environ.get("FT_DEBUG_GLU") and _debug_glu_seen <= 3:
+                print("[glu-probe] 5 fused kernel launched, syncing", flush=True)
+                torch.cuda.synchronize()
+                print("[glu-probe] 5 fused kernel ok", flush=True)
         else:
             h = mul_mat_id(gate_up, gate_up_type, x)
             t, k, two_i = h.shape
@@ -166,3 +175,107 @@ class GGUFMoEMethod(MoEMethod):
         # an NVFP4 layer of a file with weight scales reads the layout's global bank too
         scaled = self.cfg.scheme.weight.scale is not None and NVFP4 in (gate_up, down)
         return "gguf_scaled" if scaled else "gguf", {"gate_up_type": gate_up, "down_type": down}
+
+
+_debug_glu_seen = 0
+_debug_mmq_seen = 0
+
+
+def _debug_mmq_inputs(w, ggml_type, a, ids, is_prefill):
+    """FT_DEBUG_MMQ=1: check ggml.mul_mat_id's inputs on the host and raise before a bad launch (diagnostic, 2026-11-03).
+
+    The standalone repro (scripts/ggml_moe_repro.py) passes 140/140 at the real shapes, so a fault in the app means
+    these inputs differ: ids range, weight view layout, the zero tail MMQ reads past the last row, or non-finite x.
+    """
+    global _debug_mmq_seen
+    import time
+
+    from freetoken.kernel import ggml as _g
+
+    verbose = _debug_mmq_seen < 6
+    t0 = time.perf_counter()
+    torch.cuda.synchronize()  # a fault here came from earlier work, not from this GEMM
+    if verbose:
+        print(f"[mmq-debug] entry sync ok in {time.perf_counter() - t0:.3f}s", flush=True)
+    k = a.shape[-1]
+    t, top_k = ids.shape
+    problems = []
+    if not (w.is_cuda and a.is_cuda and ids.is_cuda):
+        problems.append(f"device w={w.device} x={a.device} ids={ids.device}")
+    if ids.dtype != torch.int32 or not ids.is_contiguous():
+        problems.append(f"ids dtype={ids.dtype} contig={ids.is_contiguous()}")
+    lo, hi = int(ids.min()), int(ids.max())
+    if lo < 0 or hi >= w.shape[0]:
+        problems.append(f"ids range [{lo}, {hi}] vs experts {w.shape[0]}")
+    if w.dim() != 3 or w.dtype != torch.uint8 or w.shape[2] != row_bytes(ggml_type, k):
+        problems.append(f"w shape={tuple(w.shape)} {w.dtype} vs row_bytes {row_bytes(ggml_type, k)} for K={k}")
+    if not w.is_contiguous():
+        problems.append(f"w not contiguous: stride={w.stride()}")
+    if w.data_ptr() % 16:
+        problems.append(f"w ptr {w.data_ptr():#x} not 16-aligned")
+    if a.shape[0] != t or (a.dim() == 3 and a.shape[1] != top_k):
+        problems.append(f"x shape {tuple(a.shape)} vs ids {tuple(ids.shape)}")
+    if not bool(torch.isfinite(a).all()):
+        problems.append(f"x has {int((~torch.isfinite(a)).sum())} non-finite values")
+    tail_info = "-"
+    if t > _g.mmvq_max_tokens(ggml_type):  # MMQ reads past the last row; that tail must exist and be zero
+        tail = _g._mmq_tail_bytes(ggml_type, k)
+        end = w.storage_offset() + w.numel()
+        have = w.untyped_storage().nbytes() - end
+        if tail and have < tail:
+            problems.append(f"MMQ tail: needs {tail} bytes after the last row, storage has {have}")
+        elif tail:
+            tail_t = torch.empty(0, dtype=torch.uint8, device=w.device).set_(w.untyped_storage(), end, (tail,))
+            nz = int(tail_t.count_nonzero())
+            tail_info = f"{tail}B nonzero={nz}"
+            if nz:
+                problems.append(f"MMQ tail has {nz}/{tail} nonzero bytes")
+    if verbose or problems:
+        _debug_mmq_seen += 1
+        print(f"[mmq-debug] prefill={is_prefill} type={ggml_type} w={tuple(w.shape)} stride={w.stride()} ptr={w.data_ptr():#x} "
+              f"off={w.storage_offset()} storage={w.untyped_storage().nbytes()} x={tuple(a.shape)} {a.dtype} ids={tuple(ids.shape)} "
+              f"range=[{lo},{hi}] tail={tail_info} problems={problems}", flush=True)
+    if problems:
+        raise RuntimeError("FT_DEBUG_MMQ: " + "; ".join(problems))
+
+
+def _debug_glu_inputs(gate_up, gate_up_type, x, ids):
+    """FT_DEBUG_GLU=1: check the fused-GLU inputs on the host and raise before a bad launch can hang the GPU (diagnostic, 2026-11-03)."""
+    global _debug_glu_seen
+    if _debug_glu_seen < 3:
+        print(f"[glu-debug] entry ids={tuple(ids.shape)} {ids.dtype} {ids.device} ptr={ids.data_ptr():#x} contig={ids.is_contiguous()} "
+              f"x={tuple(x.shape)} {x.dtype} {x.device} gate_up={tuple(gate_up.shape)} {gate_up.device}", flush=True)
+        import time
+        t0 = time.perf_counter()
+        torch.cuda.synchronize()  # a fault here came from work before this call (the ids .to(int32) included)
+        print(f"[glu-debug] entry sync ok in {time.perf_counter() - t0:.3f}s", flush=True)
+
+        def probe(label, fn):
+            print(f"[glu-probe] {time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} {label} start", flush=True)
+            t = time.perf_counter()
+            r = fn()
+            torch.cuda.synchronize()
+            print(f"[glu-probe] {label} ok in {time.perf_counter() - t:.3f}s", flush=True)
+            return r
+
+        ids_h = probe("1 ids.cpu (copy, no kernel)", lambda: ids.cpu())
+        print(f"[glu-probe] ids values {ids_h.tolist()}", flush=True)
+        probe("2 in-place kernel ids.add_(0)", lambda: ids.add_(0))
+        probe("3 fresh alloc + fill", lambda: torch.empty(1, dtype=torch.int32, device=ids.device).fill_(0))
+        probe("4 ids.min()", lambda: ids.min())
+    lo, hi = int(ids.min()), int(ids.max())
+    problems = []
+    if not (gate_up.is_cuda and x.is_cuda and ids.is_cuda):
+        problems.append(f"device gate_up={gate_up.device} x={x.device} ids={ids.device}")
+    if lo < 0 or hi >= gate_up.shape[0]:
+        problems.append(f"ids range [{lo}, {hi}] vs gate_up slots {gate_up.shape[0]}")
+    if not gate_up.is_contiguous():
+        problems.append(f"gate_up not contiguous: shape={tuple(gate_up.shape)} stride={gate_up.stride()}")
+    if gate_up.data_ptr() % 16:
+        problems.append(f"gate_up ptr {gate_up.data_ptr():#x} not 16-aligned")
+    if _debug_glu_seen < 3 or problems:
+        _debug_glu_seen += 1
+        print(f"[glu-debug] type={gate_up_type} gate_up={tuple(gate_up.shape)} {gate_up.dtype} stride={gate_up.stride()} ptr={gate_up.data_ptr():#x} "
+              f"x={tuple(x.shape)} {x.dtype} ids={tuple(ids.shape)} range=[{lo},{hi}] problems={problems}", flush=True)
+    if problems:
+        raise RuntimeError("FT_DEBUG_GLU: " + "; ".join(problems))

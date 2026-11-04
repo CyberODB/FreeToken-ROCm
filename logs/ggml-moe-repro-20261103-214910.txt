@@ -1,0 +1,6 @@
+ggml MoE repro: 2 cases, shapes {'gate_up': (1024, 2048), 'down': (2048, 512)}, E=256 top_k=8
+env AMD_SERIALIZE_KERNEL=3  log E:\freetoken-021\logs\ggml-moe-repro-20261103-214910.txt
+child up: AMD Radeon RX 9070
+[1/2] IQ4_NL gate_up T=80   route=same   bf16  MMQ  OK relerr=3.72e-03 finite=True 18.6ms  ETA 14s
+[2/2] IQ4_NL gate_up T=128  route=same   bf16  MMQ  OK relerr=3.49e-03 finite=True 0.9ms  ETA 0s
+summary: 2 OK, 0 not OK, 0 not run, 14s
