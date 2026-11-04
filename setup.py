@@ -48,6 +48,10 @@ def _rocm_paths() -> tuple[list[str], list[str], str]:
         library_dir = rocm_home / "lib"
         if not (include_dir / "hip" / "hip_runtime.h").exists():
             continue
+        if sys.platform == "win32":
+            if (library_dir / "amdhip64.lib").exists():
+                return [str(include_dir)], [str(library_dir)], "amdhip64"
+            continue
         if (library_dir / "libamdhip64.so").exists():
             return [str(include_dir)], [str(library_dir)], "amdhip64"
         versioned = sorted(library_dir.glob("libamdhip64.so.*"))
@@ -74,15 +78,31 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     return [str(cuda_home / "include")], library_dirs
 
 
+def _clang_rt_builtins() -> list[str]:
+    """Windows: clang's runtime CPU dispatch (__cpu_model) lives in compiler-rt, which clang-cl does not link into a DLL by itself."""
+    if sys.platform != "win32":
+        return []
+    import shutil
+    import subprocess
+    cxx = shutil.which(os.environ.get("CXX") or "") or ""
+    if "clang" not in Path(cxx).stem.lower():
+        return []
+    res = subprocess.run([cxx, "-print-resource-dir"], capture_output=True, text=True, check=True).stdout.strip()
+    lib = Path(res) / "lib" / "windows" / "clang_rt.builtins-x86_64.lib"
+    if not lib.exists():
+        raise RuntimeError(f"{lib} is missing; _cpu_moe needs LLVM compiler-rt")
+    return [str(lib)]
+
+
 IS_ROCM = _is_rocm()
 
 if IS_ROCM:
     runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
-    runtime_link_args = [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
+    runtime_link_args = [] if sys.platform == "win32" else [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
     # Host sources. BuildExtension supplies the ROCm
     # platform defines to the C++ compiler; offload architecture flags belong on
     # HIP device sources and would be rejected by the host compiler here.
-    extra_compile = ["-O3", "-std=c++20"]
+    extra_compile = ["/O2", "/std:c++20"] if sys.platform == "win32" else ["-O3", "-std=c++20"]
     # Device sources (.cu, built by hipcc); BuildExtension adds the offload architectures.
     device_compile = ["-O3", "-std=c++20"]
 else:
@@ -279,8 +299,8 @@ setup(
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
-            extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
-            extra_link_args=runtime_link_args,
+            extra_compile_args={"cxx": extra_compile + ([] if sys.platform == "win32" else ["-pthread"]), "nvcc": device_compile},
+            extra_link_args=runtime_link_args + _clang_rt_builtins(),
         ),
         # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
         *([

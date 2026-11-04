@@ -19,4 +19,7 @@ set "TVM_FFI_CACHE_DIR=%SRC%\.tvm-ffi-cache"
 set "PATH=%ROCM%\bin;%REPO%\.venv\Lib\site-packages\_rocm_sdk_libraries\bin;%REPO%\.venv\Scripts;%PATH%"
 set "CC=%ROCM%\lib\llvm\bin\clang-cl.exe"
 set "FREETOKEN_FT_BIN=%SRC%\bin\ft.cmd"
-start "" "C:\Users\CyberODB\AppData\Local\FreeToken Desktop\freetoken-desktop.exe"
+powershell -NoProfile -ExecutionPolicy Bypass -File "E:\freetoken-rocm\guard-daemon.ps1" -Build "TEST" || exit /b 1
+rem freetoken-desktop-test.exe is a patched copy (orange tray icon, "FreeToken TEST" label) made by
+rem E:\freetoken-rocm\patch_tray.py. It gets no app updates: re-run the patch after updating FreeToken Desktop.
+start "" "C:\Users\CyberODB\AppData\Local\FreeToken Desktop\freetoken-desktop-test.exe"

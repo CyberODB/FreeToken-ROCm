@@ -55,6 +55,8 @@ def vram_bytes_for_pids(pids: list[int]) -> int:
     if usage is None:
         usage = _smi_process_vram()
     if not usage:
+        usage = _win_process_vram()  # AMD/Intel on Windows: no NVML or nvidia-smi
+    if not usage:
         return 0
     return sum(nbytes for p, nbytes in usage.items() if p in want)
 
@@ -132,3 +134,56 @@ def _smi_process_vram() -> dict[int, int]:
             continue
         usage[int(parts[0])] = usage.get(int(parts[0]), 0) + int(parts[1]) * 1024 * 1024  # MiB
     return usage
+
+
+# Windows GPU Process Memory counters (any vendor), read through PDH. The query is opened once and
+# held; the wildcard counter covers every process, and Dedicated Usage is VRAM in bytes.
+_PDH = {"q": None, "c": None, "failed": False}
+_PDH_LOCK = threading.Lock()
+
+
+def _win_process_vram() -> dict[int, int]:
+    import os
+
+    if os.name != "nt" or _PDH["failed"]:
+        return {}
+    import ctypes
+    import re
+    from ctypes import wintypes
+
+    class _Val(ctypes.Structure):
+        _fields_ = [("CStatus", wintypes.DWORD), ("big", ctypes.c_longlong)]
+
+    class _Item(ctypes.Structure):
+        _fields_ = [("name", wintypes.LPWSTR), ("val", _Val)]
+
+    pdh = ctypes.windll.pdh
+    with _PDH_LOCK:
+        try:
+            if _PDH["q"] is None:
+                q, c = ctypes.c_void_p(), ctypes.c_void_p()
+                if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)):
+                    raise OSError("PdhOpenQuery")
+                if pdh.PdhAddEnglishCounterW(q, r"\GPU Process Memory(*)\Dedicated Usage", 0, ctypes.byref(c)):
+                    raise OSError("PdhAddEnglishCounter")
+                _PDH["q"], _PDH["c"] = q, c
+            if pdh.PdhCollectQueryData(_PDH["q"]):
+                return {}
+            size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+            pdh.PdhGetFormattedCounterArrayW(_PDH["c"], 0x400, ctypes.byref(size), ctypes.byref(count), None)  # PDH_FMT_LARGE
+            if not size.value:
+                return {}
+            buf = ctypes.create_string_buffer(size.value)
+            if pdh.PdhGetFormattedCounterArrayW(_PDH["c"], 0x400, ctypes.byref(size), ctypes.byref(count), buf):
+                return {}
+            items = ctypes.cast(buf, ctypes.POINTER(_Item))
+            out: dict[int, int] = {}
+            for i in range(count.value):
+                m = re.match(r"pid_(\d+)_", items[i].name or "")
+                if m and items[i].val.CStatus in (0, 0x00000001):  # valid / new data
+                    pid = int(m.group(1))
+                    out[pid] = out.get(pid, 0) + max(0, items[i].val.big)
+            return out
+        except Exception:  # noqa: BLE001
+            _PDH["failed"] = True
+            return {}

@@ -1,7 +1,9 @@
 #pragma once
 #include <freetoken/utils.cuh>
 
+#if !defined(_WIN32) && !FREETOKEN_USE_ROCM
 #include <sys/cdefs.h>
+#endif
 
 #include <cstddef>
 

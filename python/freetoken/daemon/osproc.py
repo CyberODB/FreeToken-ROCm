@@ -114,6 +114,14 @@ def tree_pids(root_pid: int) -> list[int]:
     mp-spawned scheduler/tokenizer workers inherit that group, so pgid membership captures the
     whole tree without walking ppid chains. Falls back to ``[root_pid]`` off-/proc."""
     if not _HAS_PROC:
+        if os.name == "nt":  # patched: no pgid on Windows; walk the parent chain instead
+            try:
+                import psutil
+
+                root = psutil.Process(root_pid)
+                return [root_pid] + [c.pid for c in root.children(recursive=True)]
+            except Exception:  # noqa: BLE001 -- psutil missing or root gone
+                pass
         return [root_pid] if pid_alive(root_pid) else []
     out = []
     for pid in _iter_all_pids():
@@ -122,6 +130,62 @@ def tree_pids(root_pid: int) -> list[int]:
     if root_pid not in out and pid_alive(root_pid):
         out.append(root_pid)
     return out
+
+
+# patched: Windows has no parent-death signal, and os.kill(self, SIGTERM) there is TerminateProcess,
+# which skips every Python-level teardown. A job object with KILL_ON_JOB_CLOSE makes the OS kill
+# all workers the moment the serve process dies, however it dies. The handle is held for the
+# process lifetime: closing it early would kill the serve itself (it is in the job too).
+_JOB_HANDLE = None
+
+
+def kill_workers_with_me() -> bool:
+    """Windows only: put this process in a kill-on-close job so every child spawned AFTER this
+    call dies with it. Call before the first worker starts. No-op (False) elsewhere or on failure."""
+    global _JOB_HANDLE
+    if os.name != "nt" or _JOB_HANDLE is not None:
+        return _JOB_HANDLE is not None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+        class _Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+        class _Extended(ctypes.Structure):
+            _fields_ = [("Basic", _Basic), ("Io", _IoCounters), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        job = k32.CreateJobObjectW(None, None)  # NULL security attrs: not inheritable
+        if not job:
+            raise OSError(ctypes.get_last_error(), "CreateJobObject")
+        info = _Extended()
+        info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # Extended info
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject")
+        if not k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject")
+        _JOB_HANDLE = job
+        return True
+    except Exception as exc:  # noqa: BLE001 -- never block startup over this
+        import logging
+
+        logging.getLogger(__name__).warning("worker job object not set up (%s); workers may outlive a crash", exc)
+        return False
 
 
 def signal_group(pid: int, sig: int) -> None:

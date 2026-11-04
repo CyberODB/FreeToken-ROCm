@@ -30,6 +30,8 @@ def _expert_rows(info: GgufTensorInfo) -> torch.Tensor:
 
 
 def _drop_page_cache(info: GgufTensorInfo) -> None:
+    if not hasattr(os, "posix_fadvise"):  # Windows
+        return
     try:
         fd = os.open(info.path, os.O_RDONLY)
         try:

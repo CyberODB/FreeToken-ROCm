@@ -45,6 +45,16 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 _warned_rope_fallback = False
 
 
+def _sdpa(q, k, v):
+    # ROCm/Windows: the mem-efficient SDPA backend raises hipErrorInvalidValue; flash and math work
+    if torch.version.hip:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
+            return F.scaled_dot_product_attention(q, k, v)
+    return F.scaled_dot_product_attention(q, k, v)
+
+
 def _apply_vision_rope(
     q: torch.Tensor, k: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, head_dim: int
 ) -> None:
@@ -97,7 +107,7 @@ class VisionAttention(BaseOP):
         v = v.transpose(0, 1).unsqueeze(0)
         # bidirectional attention within each image; images never attend across
         outs = [
-            F.scaled_dot_product_attention(qs, ks, vs)
+            _sdpa(qs, ks, vs)
             for qs, ks, vs in zip(
                 torch.split(q, lengths, dim=2),
                 torch.split(k, lengths, dim=2),

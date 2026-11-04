@@ -156,6 +156,9 @@ def launch_server(
         from .supervisor import BackendHandle
 
         mp.set_start_method("spawn", force=True)
+        from freetoken.daemon.osproc import kill_workers_with_me
+
+        kill_workers_with_me()  # patched: Windows workers die with this process, however it exits
         detach = server_args.shell_mode  # see _detach_process_group
 
         world_size = server_args.tp_info.size

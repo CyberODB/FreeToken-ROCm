@@ -98,6 +98,10 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
         if _SHUTTING_DOWN.is_set():
             return  # an external stop got here first
         logger.error("Backend worker is gone and cannot be restarted; stopping the API server")
+        if os.name == "nt":  # patched: this kill skips lifespan teardown on Windows
+            _SHUTTING_DOWN.set()
+            if _GLOBAL_STATE is not None:
+                _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
         os.kill(os.getpid(), signal.SIGTERM)
 
     timer = threading.Timer(grace_s, _stop)

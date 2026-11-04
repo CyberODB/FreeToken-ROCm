@@ -161,6 +161,10 @@
 #define CUDART_CB
 #endif
 
+#ifndef __always_inline
+#define __always_inline inline __attribute__((always_inline))
+#endif
+
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif
