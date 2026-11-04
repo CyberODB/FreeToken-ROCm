@@ -6,6 +6,13 @@
   </picture>
 </div>
 
+> [!NOTE]
+> **Credits.** [FreeToken](https://github.com/FlashML-org/FreeToken) is by FlashML-org (Apache 2.0).
+> The Windows + AMD ROCm port on this branch is by [Maxritz](https://github.com/Maxritz/FreeToken-ROCm),
+> with contributions from PialGhosh2233, Castoff995, Elliot, Aron van Ammers, Roman Baumer and Daniel Bittencourt.
+> CyberODB's fork adds RX 9070 fixes and desktop launchers (see [README.cyberodb.md](README.cyberodb.md)),
+> made with help from Claude. A build on FreeToken v0.2.1 is on the `win-rocm-021` branch.
+
 > [!IMPORTANT]
 > **This fork: native Windows + AMD ROCm port** (`FreeToken-rocm-test`).
 > Verified end-to-end on an AMD Radeon RX 9070 XT & RX 9060 XT (gfx1201 / gfx1200 / RDNA4, 16 GB, Windows 11):
