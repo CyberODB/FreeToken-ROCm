@@ -6,6 +6,14 @@
   </picture>
 </div>
 
+> [!NOTE]
+> **This branch (`win-rocm-021`): Windows + AMD ROCm test build on [FreeToken](https://github.com/FlashML-org/FreeToken) v0.2.1.**
+> FreeToken is by FlashML-org (Apache 2.0), and v0.2.1 includes upstream's own ROCm support.
+> The Windows/ROCm work started from [Maxritz's FreeToken-ROCm](https://github.com/Maxritz/FreeToken-ROCm)
+> (with contributions from PialGhosh2233, Castoff995, Elliot, Aron van Ammers, Roman Baumer and Daniel Bittencourt);
+> parts of it are re-applied here on top of v0.2.1, with Windows daemon, launcher and RX 9070 fixes
+> by CyberODB, made with help from Claude. The older port with Maxritz's full history is on `main`.
+
 <p align="center">
 | <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/issues/482"><b>Community WeChat</b></a> |
 </p>
