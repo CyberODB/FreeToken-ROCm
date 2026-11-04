@@ -96,6 +96,18 @@ def physical_core_cpus() -> list[int]:
         allowed = sorted(os.sched_getaffinity(0))
     except AttributeError:
         allowed = list(range(os.cpu_count() or 1))
+    # Windows (2026-11-03, local patch): no sysfs, so every logical CPU used to count as a core
+    # (16 pool threads on an 8-core 5800X, oversubscribing the spin-barrier). Windows numbers SMT
+    # siblings adjacently (0/1, 2/3, ...), so take every other CPU when psutil reports 2-way SMT.
+    if os.name == "nt":
+        try:
+            import psutil
+
+            phys = psutil.cpu_count(logical=False) or 0
+        except Exception:
+            phys = 0
+        if phys and len(allowed) == 2 * phys:
+            return allowed[::2]
     reps: list[int] = []
     seen: set[str] = set()
     for cpu in allowed:
@@ -113,12 +125,16 @@ def physical_core_cpus() -> list[int]:
 
 def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
     """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
-    if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
+    if not _SPIN_WAIT:
         return False
+    try:
+        allowed = set(os.sched_getaffinity(0))
+    except AttributeError:  # Windows (2026-11-03, local patch): no sched_getaffinity
+        allowed = set(range(os.cpu_count() or 1))
     pool = list(core_ids) + ([coord_core] if coord_core >= 0 else [])
     if len(set(pool)) != len(pool):
         return False
-    spare = set(os.sched_getaffinity(0)) - set(pool)
+    spare = allowed - set(pool)
     return len(spare) >= 2
 
 
