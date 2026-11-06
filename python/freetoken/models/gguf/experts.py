@@ -44,6 +44,63 @@ def _drop_page_cache(info: GgufTensorInfo) -> None:
         pass
 
 
+# ROCm Windows fork 2026-11-05: Windows has no O_DIRECT / preadv, so banks filled from the file mmap one page fault at a
+# time on one thread. Threaded positional reads straight into the bank instead; FREETOKEN_GGUF_READ_THREADS=0 restores the mmap copy.
+_READ_THREADS = int(os.getenv("FREETOKEN_GGUF_READ_THREADS", "8" if os.name == "nt" else "0"))
+
+
+class _ThreadedReader:
+    """A thread pool, each worker with its own unbuffered handle per file; ``read(path, offset, dst)`` fills a contiguous tensor."""
+
+    def __init__(self, workers: int):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._local = threading.local()
+        self._pool = ThreadPoolExecutor(workers, thread_name_prefix="gguf-read")
+        self._jobs: list = []
+
+    def _handle(self, path: str):
+        files = self._local.__dict__.setdefault("files", {})
+        if path not in files:
+            files[path] = open(path, "rb", buffering=0)
+        return files[path]
+
+    def _read(self, path: str, offset: int, addr: int, nbytes: int) -> None:
+        import ctypes
+
+        f = self._handle(path)
+        f.seek(offset)
+        mv = memoryview((ctypes.c_char * nbytes).from_address(addr)).cast("B")
+        done = 0
+        while done < nbytes:
+            got = f.readinto(mv[done:])
+            if not got:
+                raise OSError(f"{path}: short read at {offset + done} ({done} of {nbytes} bytes)")
+            done += got
+
+    def read(self, path: str, offset: int, dst: torch.Tensor) -> None:
+        assert dst.is_contiguous()
+        self._jobs.append(self._pool.submit(self._read, path, offset, dst.data_ptr(), dst.numel() * dst.element_size()))
+
+    def wait(self) -> None:
+        jobs, self._jobs = self._jobs, []
+        for j in jobs:
+            j.result()
+
+    def close(self) -> None:
+        self.wait()
+        self._pool.shutdown()
+
+
+def _read_rows(reader: _ThreadedReader, info: GgufTensorInfo, dst: torch.Tensor) -> None:
+    """Queue reads of ``info``'s [E, rows, row] bytes into ``dst`` (a [E, rows, row] slice of a bank, contiguous per expert)."""
+    experts = dst.shape[0]
+    per = info.nbytes // experts
+    for e in range(experts):
+        reader.read(info.path, info.offset + e * per, dst[e])
+
+
 def _device_bank(shape: tuple[int, ...], ggml_type: int, k: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     """An [E, rows, row] device bank; a zero row follows the last one when ggml's MMQ tiles read past it."""
     experts, rows, row = shape
@@ -88,7 +145,12 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
     sources: dict[str, list[torch.Tensor]] = {role: [] for role in roles}
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
-    with PinPipeline() if device is None else contextlib.nullcontext() as pins:
+    reader = _ThreadedReader(_READ_THREADS) if _READ_THREADS > 0 and device is None and not dummy else None
+    if reader is not None:
+        logger.info_rank0(f"GGUF expert banks: threaded file reads ({_READ_THREADS} threads)")
+    with PinPipeline() if device is None else contextlib.nullcontext() as pins, contextlib.ExitStack() as stack:
+        if reader is not None:
+            stack.callback(reader.close)
         for layer in range(num_layers):
             blk = f"blk.{first_layer + layer}"
             down = index[f"{blk}.ffn_down_exps.weight"]
@@ -156,10 +218,20 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                     banks["down_bias"].zero_()
             else:
                 start = 0
-                for r in rows:
-                    banks["gate_up"][:, start : start + r.shape[1]].copy_(r)
+                for info, r in zip(parts, rows):
+                    dst = banks["gate_up"][:, start : start + r.shape[1]]
+                    if reader is not None and dst.dtype == r.dtype:
+                        _read_rows(reader, info, dst)
+                    else:
+                        dst.copy_(r)
                     start += r.shape[1]
-                banks["down"].copy_(d)
+                if reader is not None and banks["down"].dtype == d.dtype:
+                    _read_rows(reader, down, banks["down"])
+                    reader.wait()
+                else:
+                    if reader is not None:
+                        reader.wait()
+                    banks["down"].copy_(d)
                 for info in (*parts, down):
                     _drop_page_cache(info)
             if device is None:
