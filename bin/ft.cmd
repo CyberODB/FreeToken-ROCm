@@ -21,10 +21,11 @@ set "TVM_FFI_CACHE_DIR=%SRC%\.tvm-ffi-cache"
 set "PATH=%ROCM%\bin;%REPO%\.venv\Lib\site-packages\_rocm_sdk_libraries\bin;%REPO%\.venv\Scripts;%PATH%"
 set "CC=%ROCM%\lib\llvm\bin\clang-cl.exe"
 set "ARGS=%*"
-if /i "%~1"=="serve" (
-  set "ARGS=%ARGS:~5%"
-  "%REPO%\.venv\Scripts\ft.exe" serve --cuda-graph-max-bs 0 %ARGS%
-) else (
-  "%REPO%\.venv\Scripts\ft.exe" %ARGS%
-)
+rem %ARGS% inside a ( ) block expands before the block runs, so strip "serve" here, outside it (fixed 2026-11-05).
+if /i "%~1"=="serve" goto :serve
+"%REPO%\.venv\Scripts\ft.exe" %ARGS%
+exit /b %ERRORLEVEL%
+:serve
+set "ARGS=%ARGS:~5%"
+"%REPO%\.venv\Scripts\ft.exe" serve --cuda-graph-max-bs 0 %ARGS%
 exit /b %ERRORLEVEL%

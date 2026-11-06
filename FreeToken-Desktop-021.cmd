@@ -29,14 +29,19 @@ rem Diagnostic 2026-11-03: check prefill MoE GEMM inputs (ids, view, MMQ zero ta
 rem set "FT_DEBUG_MMQ=1"
 rem 2026-11-03: hybrid. auto + a fixed pin budget picks the split from the budget (no pin probe), so the
 rem PINNED layers can be born pinned (host_banks.backing_for). 12 GiB = the code's 40%-of-RAM WDDM rule.
+rem Test 2026-11-04: 14 GiB (driver refused near ~14 in the 11-03 21:40 pin probe). 7 CPU layers instead of 12.
+rem Undo: set back to 12. A refused pin is a load error with a fixed budget.
 set "FT_EXTRA_SERVE_ARGS=--moe-cpu-layers auto"
-set "FREETOKEN_PIN_BUDGET_GB=12"
+set "FREETOKEN_PIN_BUDGET_GB=14"
 rem Diagnostic 2026-11-03 A/B: expert banks born pinned (hipHostMalloc), not mmap + hipHostRegister. Remove after.
 set "FREETOKEN_BANK_CUDA_ALLOC=1"
 rem Measurement 2026-11-03: per-phase decode timing, logged as [hybrid-timing] every 16 steps in serve-1919.log.
 rem Slows decode (syncs the GPU around every phase, overlap off). Off since 2026-11-03 23:35; remove "rem " on both lines to turn back on.
 rem set "FREETOKEN_HYBRID_TIMING=16"
 rem set "FREETOKEN_HYBRID_OVERLAP=0"
+rem Measurement 2026-11-04: time 32 decode steps once (after 24 warm-up steps): CPU enqueue vs GPU finish,
+rem logged in serve-1919.log as [decode-profile]. FREETOKEN_DECODE_PROFILE_MODE=torch gives the torch.profiler table instead.
+set "FREETOKEN_DECODE_PROFILE=32"
 powershell -NoProfile -ExecutionPolicy Bypass -File "E:\freetoken-rocm\guard-daemon.ps1" -Build "TEST" || exit /b 1
 rem freetoken-desktop-test.exe is a patched copy (orange tray icon, "FreeToken TEST" label) made by
 rem E:\freetoken-rocm\patch_tray.py. It gets no app updates: re-run the patch after updating FreeToken Desktop.

@@ -215,8 +215,44 @@ _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-proces
 _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks fail too
 
 
+def _os_lock_windows(addr: int, nbytes: int) -> None:
+    """VirtualLock the range. ROCm fork 2026-11-04: the POSIX path needs ``resource``/libc mlock, absent on Windows.
+
+    VirtualLock fails (ERROR_WORKING_SET_QUOTA, 1453) unless the process working-set minimum covers every locked byte, so grow it first."""
+    global _os_locked_total
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.GetProcessWorkingSetSizeEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+                                               ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(wintypes.DWORD)]
+    k32.SetProcessWorkingSetSizeEx.argtypes = [wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
+    k32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    proc = k32.GetCurrentProcess()
+    lo, hi, flags = ctypes.c_size_t(), ctypes.c_size_t(), wintypes.DWORD()
+    if not k32.GetProcessWorkingSetSizeEx(proc, ctypes.byref(lo), ctypes.byref(hi), ctypes.byref(flags)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    slack = 256 << 20
+    want_lo = _os_locked_total + nbytes + slack
+    if lo.value < want_lo:
+        # min must stay <= max; keep the flags the process already has
+        if not k32.SetProcessWorkingSetSizeEx(proc, want_lo, max(hi.value, want_lo + slack), flags.value):
+            raise ctypes.WinError(ctypes.get_last_error())
+    if not k32.VirtualLock(ctypes.c_void_p(addr), nbytes):
+        err = ctypes.get_last_error()
+        raise OSError(
+            err,
+            f"VirtualLock({nbytes / 2**30:.1f} GiB, {_os_locked_total / 2**30:.1f} GiB already locked): "
+            f"{ctypes.FormatError(err).strip()} (working-set quota or not enough free RAM; "
+            f"shrink --moe-cpu-layers)",
+        )
+    _os_locked_total += nbytes
+
+
 def _os_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
+    if sys.platform == "win32":
+        return _os_lock_windows(addr, nbytes)
     import resource
 
     # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
