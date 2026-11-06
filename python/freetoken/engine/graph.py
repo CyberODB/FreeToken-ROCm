@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal
 
 import torch
+
+from freetoken.kernel import graph_stamps
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
@@ -206,6 +208,7 @@ class GraphRunner:
 
         self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, mrope=self.mrope, rows_per_req=self.rows_per_req)
         self._reset_moe_offload_cache()
+        stamps = graph_stamps.get()  # built before capture: it allocates and JIT-compiles
 
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
@@ -232,7 +235,11 @@ class GraphRunner:
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    if stamps is not None:
+                        stamps.stamp("host gap")
                     self._store_output(bs, self.forward())
+                    if stamps is not None:
+                        stamps.stamp("final norm + head")
                 _upload_graph(graph, self.stream)
                 self._reset_moe_offload_cache()
             if pool is None:

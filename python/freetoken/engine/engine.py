@@ -34,6 +34,7 @@ from .config import EngineConfig
 from .decode_prof import decode_profiler
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from freetoken.kernel import graph_stamps
 from .spec_protocol import SpecRuntime
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -1405,6 +1406,12 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        stamps = graph_stamps.get()
+        if stamps is not None and self.graph_runner.can_use_cuda_graph(batch):
+            if stamps.counter_fn is None and self.moe_offload_cache is not None:
+                cache = self.moe_offload_cache
+                stamps.counter_fn = lambda: cache.hybrid_stats[1].view(-1, 4) if cache.decode_target == "hybrid" else None
+            stamps.after_sample()
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

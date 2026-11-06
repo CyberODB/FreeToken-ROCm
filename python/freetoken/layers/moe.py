@@ -98,6 +98,8 @@ class _PhaseTimer:
 
 _timer = _PhaseTimer(_HYBRID_TIMING) if _HYBRID_TIMING > 0 else None
 
+from freetoken.kernel.graph_stamps import stamp as _gstamp  # noqa: E402  (no-op unless FREETOKEN_GRAPH_STAMPS)
+
 
 def _debug_sync(stage: str, layer_id: int) -> None:
     global _debug_sync_left
@@ -369,10 +371,12 @@ class OffloadMoELayer(MoELayer):
         timer = _timer if _timer is not None and _timer.active() else None
         if timer is not None:
             timer.layer_start(self.layer_id, hidden_states.shape[0])
+        _gstamp("rest of layer (norm, attn/GDN, shared, router)", self.layer_id)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             out = executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+            _gstamp("CPU-only layer MoE", self.layer_id)
             if timer is not None:
                 timer.mark("CPU-only layers: CPU MoE")
                 timer.count("CPU-only layers", 1)
@@ -383,9 +387,11 @@ class OffloadMoELayer(MoELayer):
         if timer is not None:
             timer.count("plain GPU layers", 1)
         cache.ensure_experts(self.layer_id, topk_ids)
+        _gstamp("ensure/split", self.layer_id)
         if timer is not None:
             timer.mark("plain layers: ensure_experts")
         cache.copy_missing()
+        _gstamp("PCIe fetch (plain)", self.layer_id)
         if timer is not None:
             timer.mark("plain layers: PCIe fetch")
         out = self._expert_gemm(
@@ -398,6 +404,7 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        _gstamp("GPU expert GEMM", self.layer_id)
         if timer is not None:
             timer.mark("plain layers: GPU expert GEMM")
         return out
@@ -430,6 +437,7 @@ class OffloadMoELayer(MoELayer):
         gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
         _debug_sync("after_ensure_experts_hybrid", self.layer_id)
         kind = "locked" if self.layer_id in cache.locked_hybrid else "pinned"
+        _gstamp("ensure/split", self.layer_id)
         if timer is not None:
             timer.mark(f"hybrid {kind}: ensure/routing split")
             timer.count(f"hybrid {kind} layers", 1)
@@ -437,6 +445,7 @@ class OffloadMoELayer(MoELayer):
             timer.count(f"hybrid {kind} GPU routes", int((gpu_w != 0).sum()))
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
         _debug_sync("after_cpu_decode_submit", self.layer_id)
+        _gstamp("CPU publish", self.layer_id)
         if timer is not None:
             timer.mark(f"hybrid {kind}: CPU submit")
 
@@ -449,11 +458,13 @@ class OffloadMoELayer(MoELayer):
         )
         if not overlap:
             _debug_sync("after_cpu_decode_sync_early", self.layer_id)
+            _gstamp("CPU MoE (serial)", self.layer_id)
             if timer is not None:
                 timer.mark(f"hybrid {kind}: CPU MoE (serial)")
 
         cache.copy_missing()
         _debug_sync("after_copy_missing", self.layer_id)
+        _gstamp(f"PCIe fetch ({kind})", self.layer_id)
         if timer is not None:
             timer.mark(f"hybrid {kind}: PCIe fetch")
         gpu_routed = self._expert_gemm(
@@ -467,12 +478,14 @@ class OffloadMoELayer(MoELayer):
             is_prefill=False,
         )
         _debug_sync("after_gpu_expert_gemm", self.layer_id)
+        _gstamp("GPU expert GEMM", self.layer_id)
         if timer is not None:
             timer.mark(f"hybrid {kind}: GPU expert GEMM")
         if not overlap:
             return gpu_routed + cpu_routed_early
         out = executor.decode_sync(pending, add_to=gpu_routed)
         _debug_sync("after_cpu_decode_sync", self.layer_id)
+        _gstamp("CPU wait + combine", self.layer_id)
         if timer is not None:
             timer.mark(f"hybrid {kind}: CPU wait (not hidden)")
         return out
