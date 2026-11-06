@@ -14,6 +14,11 @@
 > kernels and hipcc/tvm-ffi JIT-compiled CUDA-C++ kernels. See
 > [Windows ROCm port](#windows-rocm-port) below for requirements, setup and switches.
 >
+> **Newer work is on [`win-rocm-021`](https://github.com/CyberODB/FreeToken-ROCm/tree/win-rocm-021)**
+> (FreeToken v0.2.1 base): HIP graphs in hybrid MoE decode at 47-58 tok/s (was 12-14.5), GGUF
+> expert banks loading in 35 s (was 86-87 s) and faster startup, measured on an RX 9070 with
+> Qwen3.6-35B-A3B IQ4_NL. See that branch's README for the table and switches.
+>
 > **FreeToken Desktop on ROCm (in progress, tested on an RX 9070, gfx1201):** the desktop app can
 > use this fork's engine through a shim, and the daemon now starts on Windows. Loading a model
 > from the app is **not yet verified end to end**, and quantized GGUF support is partial. See

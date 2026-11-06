@@ -12,6 +12,11 @@
 > with contributions from PialGhosh2233, Castoff995, Elliot, Aron van Ammers, Roman Baumer and Daniel Bittencourt.
 > CyberODB's fork adds RX 9070 fixes and desktop launchers (see [README.cyberodb.md](README.cyberodb.md)),
 > made with help from Claude. A build on FreeToken v0.2.1 is on the `win-rocm-021` branch.
+>
+> **Newer work is on [`win-rocm-021`](https://github.com/CyberODB/FreeToken-ROCm/tree/win-rocm-021).**
+> On an RX 9070 with Qwen3.6-35B-A3B IQ4_NL GGUF in hybrid MoE mode, HIP graphs now work in hybrid
+> decode (47-58 tok/s, was 12-14.5), and expert banks load in 35 s (was 86-87 s), with faster startup.
+> See the milestones table in that branch's README.
 
 > [!IMPORTANT]
 > **This fork: native Windows + AMD ROCm port** (`FreeToken-rocm-test`).
