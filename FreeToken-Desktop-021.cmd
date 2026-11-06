@@ -34,7 +34,8 @@ rem 2026-11-03: hybrid. auto + a fixed pin budget picks the split from the budge
 rem PINNED layers can be born pinned (host_banks.backing_for). 12 GiB = the code's 40%-of-RAM WDDM rule.
 rem Test 2026-11-04: 14 GiB (driver refused near ~14 in the 11-03 21:40 pin probe). 7 CPU layers instead of 12.
 rem Undo: set back to 12. A refused pin is a load error with a fixed budget.
-set "FT_EXTRA_SERVE_ARGS=--moe-cpu-layers auto"
+rem FT_MEASURE_ARGS comes from FreeToken-Desktop-021-measure.cmd (empty otherwise).
+set "FT_EXTRA_SERVE_ARGS=--moe-cpu-layers auto %FT_MEASURE_ARGS%"
 set "FREETOKEN_PIN_BUDGET_GB=14"
 rem Diagnostic 2026-11-03 A/B: expert banks born pinned (hipHostMalloc), not mmap + hipHostRegister. Remove after.
 set "FREETOKEN_BANK_CUDA_ALLOC=1"
