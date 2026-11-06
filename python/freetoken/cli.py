@@ -25,6 +25,12 @@ Use "ft --version" to print the FreeToken version.""",
 
 
 def _run_serve(argv: list[str]) -> int:
+    from freetoken.ram_preflight import run_before_serve
+
+    # ROCm fork 2026-11-06: warn (window + Close buttons) when the model won't fit in free RAM; only with FREETOKEN_HOST_RESERVE_GB set
+    if not run_before_serve(list(argv)):
+        print("ft serve: load cancelled at the RAM check (logs/ram-preflight.log)", file=sys.stderr)
+        return 1
     from freetoken.server import launch_server
 
     launch_server(argv=argv, prog="ft serve")
