@@ -136,7 +136,8 @@ class GGUFReader:
     }
 
     def __init__(self, path: os.PathLike[str] | str, mode: Literal['r', 'r+', 'c'] = 'r'):
-        self.data = np.memmap(path, mode = mode)
+        # FreeToken: index a plain ndarray view of the map; memmap.__getitem__ + __array_finalize__ cost seconds over a 250k-token vocab
+        self.data = np.memmap(path, mode = mode).view(np.ndarray)
         offs = 0
 
         # Check for GGUF magic
@@ -208,7 +209,7 @@ class GGUFReader:
         self, offset: int, dtype: npt.DTypeLike, count: int = 1, override_order: None | Literal['I', 'S', '<'] = None,
     ) -> npt.NDArray[Any]:
         count = int(count)
-        itemsize = int(np.empty([], dtype = dtype).itemsize)
+        itemsize = np.dtype(dtype).itemsize
         end_offs = offset + itemsize * count
         arr = self.data[offset:end_offs].view(dtype=dtype)[:count]
         return arr.view(arr.dtype.newbyteorder(self.byte_order if override_order is None else override_order))
@@ -259,6 +260,26 @@ class GGUFReader:
             offs += int(alen.nbytes)
             aparts: list[npt.NDArray[Any]] = [raw_itype, alen]
             data_idxs: list[int] = []
+            if int(raw_itype[0]) == GGUFValueType.STRING:
+                # FreeToken: inline the per-string recursion for string arrays (tokenizer vocab + merges,
+                # ~500k items); same parts, indices and dtypes as the generic path below.
+                data, nbytes = self.data, self.data.nbytes
+                u64 = np.dtype(np.uint64).newbyteorder(self.byte_order)
+                u8 = np.dtype(np.uint8).newbyteorder(self.byte_order)
+                if int(alen[0]):
+                    types.append(GGUFValueType.STRING)
+                for _ in range(int(alen[0])):
+                    slen = data[offs:offs + 8].view(u64)
+                    n = int(slen[0])
+                    if n > GGUF_MAX_STRING_LENGTH:
+                        raise ValueError(f'String length {n} exceeds maximum {GGUF_MAX_STRING_LENGTH}')
+                    if offs + 8 + n > nbytes:
+                        raise ValueError(f'String length {n} exceeds remaining file size {nbytes - offs - 8}')
+                    aparts.append(slen)
+                    aparts.append(data[offs + 8:offs + 8 + n].view(u8))
+                    data_idxs.append(len(aparts) - 1)
+                    offs += 8 + n
+                return offs - orig_offs, aparts, data_idxs, types
             # FIXME: Handle multi-dimensional arrays properly instead of flattening
             for idx in range(alen[0]):
                 curr_size, curr_parts, curr_idxs, curr_types = self._get_field_parts(offs, raw_itype[0])

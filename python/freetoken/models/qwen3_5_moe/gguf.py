@@ -15,7 +15,7 @@ import torch
 from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.mmproj import find_mmproj, log_mmproj
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, prefetch
 from freetoken.models.qwen3_vl.gguf import gguf_mm_config, iter_mmproj_weights
 
 from .config import parse_config
@@ -244,6 +244,11 @@ def iter_gguf_weights(
 
     def norm(name: str) -> torch.Tensor:
         return float_tensor(t(name)).float() - 1.0
+
+    # read ahead in roughly the order this generator consumes; the routed experts load separately
+    first = ("token_embd.weight", "output.weight", "output_norm.weight")
+    order = [index[n] for n in first if n in index] + [i for n, i in index.items() if "_exps" not in n and n not in first]
+    prefetch(order + (list(gguf_tensor_index(find_mmproj(model_path).path).values()) if vision else []))
 
     yield from fused("model.embed_tokens", [t("token_embd")], [matrix(t("token_embd"))], hidden)
     if not config.tie_word_embeddings:

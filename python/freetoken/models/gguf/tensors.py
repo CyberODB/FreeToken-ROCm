@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Iterator
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterable, Iterator
 
 import numpy as np
 import torch
@@ -12,6 +15,36 @@ from freetoken.layers.quantization.ggml_types import NVFP4, is_quantized, pad_ro
 from .reader import GgufTensorInfo, gguf_tensor_index
 
 _FLOAT_DTYPES = {0: torch.float32, 1: torch.float16, 30: torch.bfloat16}
+
+# ROCm Windows fork: background threads that read tensors ahead of the loader. The dense weights load
+# through mmap views, one page fault at a time (~200 MiB/s cold on a SATA SSD); 8 parallel reads
+# warm the OS file cache at ~445 MiB/s so the mmap reads that follow hit RAM. 0 turns it off.
+_PREFETCH_THREADS = int(os.getenv("FREETOKEN_GGUF_PREFETCH_THREADS", "8" if os.name == "nt" else "0"))
+_PREFETCH_CHUNK = 16 << 20
+
+
+def prefetch(infos: Iterable[GgufTensorInfo]) -> None:
+    """Start reading these tensors' bytes in the given order from background threads; returns at once."""
+    if _PREFETCH_THREADS <= 0:
+        return
+    chunks = [(i.path, off, min(_PREFETCH_CHUNK, i.offset + i.nbytes - off)) for i in infos for off in range(i.offset, i.offset + i.nbytes, _PREFETCH_CHUNK)]
+    if not chunks:
+        return
+    local = threading.local()
+
+    def read(path: str, off: int, n: int) -> None:
+        files = local.__dict__.setdefault("files", {})
+        if path not in files:
+            files[path] = open(path, "rb", buffering=0)
+        buf = local.__dict__.setdefault("buf", bytearray(_PREFETCH_CHUNK))
+        f = files[path]
+        f.seek(off)
+        f.readinto(memoryview(buf)[:n])
+
+    pool = ThreadPoolExecutor(_PREFETCH_THREADS, thread_name_prefix="gguf-prefetch")
+    for c in chunks:
+        pool.submit(read, *c)
+    pool.shutdown(wait=False)  # the threads drain the queue and exit; their files close with them
 
 
 def float_tensor(info: GgufTensorInfo) -> torch.Tensor:
