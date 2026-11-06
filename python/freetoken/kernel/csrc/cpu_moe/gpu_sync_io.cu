@@ -1,9 +1,14 @@
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include <freetoken/hip_compat.h>
 
+#include "gpu_sync.h"
 #include "gpu_sync_io.h"
 
 namespace freetoken::cpu_moe {
@@ -71,6 +76,35 @@ __global__ void combine_kernel(uint16_t* out, const volatile uint16_t* io_y, con
   }
 }
 
+// Graph-safe GPU wait without stream memops: one thread spins on done (volatile system-scope load), bounded.
+__global__ void spin_done_kernel(const volatile int64_t* done, int32_t* timed_out) {
+  if (threadIdx.x == 0) {
+    long long n = 0;
+    while (*done < 1) {
+#if FREETOKEN_USE_ROCM
+      __builtin_amdgcn_s_sleep(2);
+#endif
+      if (++n > 400000000LL) {
+        *timed_out = 1;
+        break;
+      }
+    }
+    __threadfence_system();
+  }
+}
+
+// Production wait: unbounded like hipStreamWaitValue64(UINT64_MAX); the watchdog poisons done if the CPU never answers.
+__global__ void wait_done_kernel(const volatile int64_t* done) {
+  if (threadIdx.x == 0) {
+    while (*done < 1) {
+#if FREETOKEN_USE_ROCM
+      __builtin_amdgcn_s_sleep(2);
+#endif
+    }
+    __threadfence_system();
+  }
+}
+
 cudaError_t launch_publish(cudaStream_t stream, const uint16_t* x, const int32_t* ids, const float* w, int64_t n_x, int64_t n_ids,
                            uint16_t* io_x, int32_t* io_ids, float* io_w, volatile int64_t* ready, volatile int64_t* done, int64_t task,
                            int32_t* has_cpu) {
@@ -123,6 +157,11 @@ void KernelIo::publish(uintptr_t stream, const void* x, const int32_t* ids, cons
                        static_cast<int64_t>(num_tokens) * hidden_, static_cast<int64_t>(num_tokens) * top_k_, x_, ids_, w_, ready_, done_,
                        static_cast<int64_t>(task), has_cpu_),
         "publish launch");
+}
+
+void KernelIo::wait(uintptr_t stream) {
+  wait_done_kernel<<<1, 64, 0, reinterpret_cast<cudaStream_t>(stream)>>>(done_);
+  check(cudaGetLastError(), "wait launch");
 }
 
 void KernelIo::combine(uintptr_t stream, void* out, int num_tokens, bool accumulate) {
@@ -195,5 +234,94 @@ std::string KernelIo::probe(uintptr_t stream_handle) {
   (void)cudaFreeHost(host);
   return reason;
 }
+
+#if FREETOKEN_USE_ROCM
+std::string KernelIo::graph_probe(int replays, bool flush, bool graph) {
+  struct alignas(16) Area {
+    uint16_t x[8], io_x[8];
+    int32_t ids[2], io_ids[2];
+    float w[2], io_w[2];
+    int32_t has_cpu, timed_out;
+  };
+  GpuSync sync(false);
+  auto* ready = reinterpret_cast<volatile int64_t*>(sync.ready_word());
+  auto* done = reinterpret_cast<volatile int64_t*>(sync.done_word());
+  void* host = nullptr;
+  void* dev = nullptr;
+  if (hipHostMalloc(&host, sizeof(Area), hipHostMallocPortable | hipHostMallocMapped) != hipSuccess) return "scratch alloc failed";
+  (void)hipHostGetDevicePointer(&dev, host, 0);
+  auto* h = static_cast<Area*>(host);
+  auto* d = static_cast<Area*>(dev);
+  std::memset(h, 0, sizeof(Area));
+  h->ids[0] = 3;
+  h->ids[1] = -1;
+  hipStream_t s = nullptr;
+  hipGraph_t g = nullptr;
+  hipGraphExec_t ge = nullptr;
+  const char* step = "stream";
+  hipError_t rc = hipStreamCreateWithFlags(&s, hipStreamNonBlocking);
+  auto enqueue = [&] {
+    hipError_t e = launch_publish(s, d->x, d->ids, d->w, 8, 2, d->io_x, d->io_ids, d->io_w, ready, done, 7, &d->has_cpu);
+    if (e == hipSuccess) {
+      spin_done_kernel<<<1, 64, 0, s>>>(done, &d->timed_out);
+      e = hipGetLastError();
+    }
+    return e;
+  };
+  size_t nodes = 0;
+  if (graph) {
+    if (rc == hipSuccess && (step = "begin capture")) rc = hipStreamBeginCapture(s, hipStreamCaptureModeRelaxed);
+    if (rc == hipSuccess) {
+      hipError_t e = enqueue();
+      rc = hipStreamEndCapture(s, &g);
+      if (e != hipSuccess) rc = e;
+      step = "capture";
+    }
+    if (rc == hipSuccess && (step = "nodes")) rc = hipGraphGetNodes(g, nullptr, &nodes);
+    if (rc == hipSuccess && (step = "instantiate")) rc = hipGraphInstantiate(&ge, g, nullptr, nullptr, 0);
+  }
+  int served = 0;
+  std::vector<double> ms;
+  if (rc == hipSuccess) {
+    std::thread responder([&] {
+      for (int i = 0; i < replays; ++i) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        uint64_t t = 0;
+        while ((t = sync.cpu_poll()) == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        sync.cpu_done();
+        if (t != 7) break;
+        ++served;
+      }
+    });
+    step = "replay";
+    for (int i = 0; i < replays && rc == hipSuccess; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      rc = graph ? hipGraphLaunch(ge, s) : enqueue();
+      if (rc == hipSuccess && flush) (void)hipStreamQuery(s);
+      if (rc == hipSuccess) rc = hipStreamSynchronize(s);
+      ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      if (h->timed_out) break;
+    }
+    sync.cpu_done();
+    responder.join();
+  }
+  double sum = 0, mn = 1e9;
+  for (double v : ms) {
+    sum += v;
+    mn = std::min(mn, v);
+  }
+  char buf[320];
+  std::snprintf(buf, sizeof(buf), "%s flush=%d nodes=%zu served=%d/%d timed_out=%d avg_ms=%.3f min_ms=%.3f last step '%s' rc=%s",
+                graph ? "graph" : "eager", flush ? 1 : 0, nodes, served, replays, h->timed_out, ms.empty() ? -1.0 : sum / ms.size(),
+                ms.empty() ? -1.0 : mn, step, hipGetErrorString(rc));
+  if (ge != nullptr) (void)hipGraphExecDestroy(ge);
+  if (g != nullptr) (void)hipGraphDestroy(g);
+  if (s != nullptr) (void)hipStreamDestroy(s);
+  (void)hipHostFree(host);
+  return buf;
+}
+#else
+std::string KernelIo::graph_probe(int, bool, bool) { return "ROCm only"; }
+#endif
 
 }  // namespace freetoken::cpu_moe

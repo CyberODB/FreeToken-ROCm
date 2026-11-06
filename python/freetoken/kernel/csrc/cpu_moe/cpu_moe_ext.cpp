@@ -396,8 +396,8 @@ struct CpuMoeExecutor {
   // Start the busy-poll coordinator over the doorbell. ``pin_core`` >= 0
   // pins the coordinator to that logical CPU (the worker auto-sizing reserves it), so its
   // polling never migrates onto / contends with a GEMV worker's core.
-  void start_flag_coordinator(int pin_core) {
-    gpu_sync = std::make_unique<GpuSync>();
+  void start_flag_coordinator(int pin_core, bool require_memops) {
+    gpu_sync = std::make_unique<GpuSync>(require_memops);
     coord_stop.store(false);
     coord_pinned = CPU_MOE_HAS_AFFINITY && pin_core >= 0;
     coord_thread = std::thread([this, pin_core] {
@@ -409,7 +409,12 @@ struct CpuMoeExecutor {
   void flag_signal(uintptr_t stream, int layer_id, int num_tokens) {
     gpu_sync->gpu_submit(stream, to_word(task(layer_id, num_tokens)));
   }
-  void flag_wait(uintptr_t stream) { gpu_sync->gpu_wait(stream); }
+  void flag_wait(uintptr_t stream) {
+    if (kernel_wait) kernel_io->wait(stream);
+    else gpu_sync->gpu_wait(stream);
+  }
+  bool kernel_wait = false;  // ROCm Windows fork: spin kernel in place of the memop wait (needs kernel IO)
+  void enable_kernel_wait() { kernel_wait = kernel_io != nullptr; }
   void enable_kernel_io() {
     kernel_io = std::make_unique<KernelIo>(gpu_sync->ready_word(), gpu_sync->done_word(), io_x, io_ids, io_w, io_y, params.H,
                                            params.top_k);
@@ -525,7 +530,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("run", &CpuMoeExecutor::run, py::arg("layer_id"), py::arg("num_tokens"),
            py::call_guard<py::gil_scoped_release>())
       .def("flag_served", [](const CpuMoeExecutor& e) { return e.flag_served.load(); })
-      .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator, py::arg("pin_core"))
+      .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator, py::arg("pin_core"), py::arg("require_memops") = true)
+      .def("enable_kernel_wait", &CpuMoeExecutor::enable_kernel_wait)
       .def("flag_signal", &CpuMoeExecutor::flag_signal, py::arg("stream"), py::arg("layer_id"),
            py::arg("num_tokens"))
       .def("flag_wait", &CpuMoeExecutor::flag_wait, py::arg("stream"))
@@ -544,6 +550,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   freetoken::cpu_moe::bind_locked_fetch(m);
   m.def("memops_probe", &GpuSync::probe, py::arg("stream"));
   m.def("kernel_io_probe", &freetoken::cpu_moe::KernelIo::probe, py::arg("stream"));
+  m.def("kernel_graph_probe", &freetoken::cpu_moe::KernelIo::graph_probe, py::arg("replays") = 20, py::arg("flush") = false,
+        py::arg("graph") = true);
   m.def("host_func_capture_safe", &GpuSync::host_func_capture_safe);
   // ABI capability marker: the highest ActKind this build implements in the
   // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act

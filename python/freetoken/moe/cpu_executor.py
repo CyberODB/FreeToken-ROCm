@@ -48,6 +48,9 @@ logger = init_logger(__name__)
 # Caveat: the coordinator busy-polls one core while decode traffic flows (idle backoff
 # otherwise); FREETOKEN_CPU_MOE_FLAG_SYNC=0 opts out entirely.
 _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
+# ROCm Windows fork: where the memop probe fails, use the kernel doorbell + a GPU spin-wait instead of the
+# host-func sync (graph-safe, so hybrid decode can use HIP graphs). FREETOKEN_CPU_MOE_KERNEL_WAIT=0 opts out.
+_KERNEL_WAIT = os.getenv("FREETOKEN_CPU_MOE_KERNEL_WAIT", "1") != "0"
 # Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
 _SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
 # ds_fp4 runs its input FP8 round-trip on the GPU when it can; tests turn this off to compare against the CPU round-trip.
@@ -287,12 +290,25 @@ class CpuMoeExecutor:
         # below reserves (a coordinator time-slicing against the GEMV workers measurably
         # destabilizes throughput on fully-subscribed boxes).
         self._flag_sync = _FLAG_SYNC and device.type == "cuda"
+        self._kernel_wait = False
         if self._flag_sync and not _cpu_moe.memops_probe(torch.cuda.current_stream().cuda_stream):
+            self._flag_sync = False
+            if torch.version.hip is not None and _KERNEL_WAIT and activation_dtype == torch.bfloat16:
+                reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
+                report = reason or _cpu_moe.kernel_graph_probe(8, False, True)
+                if not reason and " served=8/8 timed_out=0 " in report and report.endswith("rc=no error"):
+                    self._flag_sync = self._kernel_wait = True
+                    logger.info_rank0(
+                        "cpu-moe: stream memops failed the startup probe; using the kernel doorbell "
+                        "+ GPU spin-wait (graph-safe)"
+                    )
+                else:
+                    logger.info_rank0(f"cpu-moe kernel spin-wait unavailable: {report}")
+        if not self._flag_sync and _FLAG_SYNC and device.type == "cuda":
             logger.info_rank0(
                 "cpu-moe flag handshake unavailable: stream memory operations failed the "
                 "startup probe; using the cudaLaunchHostFunc sync"
             )
-            self._flag_sync = False
         # ROCm 7.14 returns wrong results when it replays host-function nodes, so there only the doorbell is graph-safe.
         self._graph_capture_safe = self._flag_sync or _cpu_moe.host_func_capture_safe()
 
@@ -360,13 +376,17 @@ class CpuMoeExecutor:
         self._unhealthy = False
         self._kernel_io = False
         if self._flag_sync:
-            self._ext.start_flag_coordinator(self._coord_core)
+            self._ext.start_flag_coordinator(self._coord_core, not self._kernel_wait)
             reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
             if reason:
                 logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
             else:
                 self._ext.enable_kernel_io()
                 self._kernel_io = True
+                if self._kernel_wait:
+                    self._ext.enable_kernel_wait()
+            if self._kernel_wait and not self._kernel_io:
+                raise RuntimeError(f"cpu-moe kernel spin-wait needs kernel IO, which failed: {reason}")
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -388,7 +408,7 @@ class CpuMoeExecutor:
             self._graph_capture_safe = self._flag_sync
             if self._flag_sync:
                 reason = self._probe_graph_io(activation_dtype, capture_graph=graph_enabled)
-                if reason and self._kernel_io and activation_dtype == torch.bfloat16:
+                if reason and self._kernel_io and activation_dtype == torch.bfloat16 and not self._kernel_wait:
                     logger.warning_rank0(f"cpu-moe kernel IO probe failed ({reason}); checking event + memcpy IO")
                     # Python selects the copy path; the native KernelIo allocation lives until executor teardown.
                     self._kernel_io = False
@@ -407,7 +427,7 @@ class CpuMoeExecutor:
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
             f"spin_wait={self.spin_wait} "
-            f"handshake={'kernel' if self._kernel_io else 'event-memop' if self._flag_sync and torch.version.hip is not None else 'memop' if self._flag_sync else 'host-func'}"
+            f"handshake={'kernel-spin' if self._kernel_wait else 'kernel' if self._kernel_io else 'event-memop' if self._flag_sync and torch.version.hip is not None else 'memop' if self._flag_sync else 'host-func'}"
         )
 
     def graph_capture_safe(self, dtype: torch.dtype) -> bool:
@@ -693,6 +713,8 @@ class CpuMoeExecutor:
             self._ext.flag_publish(stream, x.data_ptr(), ids.data_ptr(), w.data_ptr(), layer_id, bs)
             return (bs, torch.empty_like(x), True)
 
+        if self._kernel_wait:
+            raise RuntimeError(f"cpu-moe kernel spin-wait handles bf16 only, got {hidden_states.dtype}")
         # D2H: ship this step's activations + routing to pinned host memory.
         io = self._io
         io["x"][:bs].copy_(hidden_states, non_blocking=True)

@@ -207,7 +207,7 @@ class LockedLayerFetch:
         self.staging_ptrs = torch.tensor([device_ptr(t) for t in self.staging], dtype=torch.int64, device=cache.device)
         cpus = _copy_cpus(executor, _copy_threads())
         # the executor's doorbell decision (FREETOKEN_CPU_MOE_FLAG_SYNC and the memop probe); without memops the gather spins on the GPU
-        memops = bool(getattr(executor, "_flag_sync", False))
+        memops = bool(getattr(executor, "_flag_sync", False)) and not getattr(executor, "_kernel_wait", False)
         self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], max_fetch, cpus, memops)
         self._wait_flag = 0 if memops else self._ext.done_word()
         logger.info_rank0(

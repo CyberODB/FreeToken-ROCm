@@ -21,6 +21,9 @@ set "CC=%ROCM%\lib\llvm\bin\clang-cl.exe"
 set "FREETOKEN_FT_BIN=%SRC%\bin\ft.cmd"
 rem CUDA graph ladder for the daemon: 0 = off, then 1, 2, 4. See serve_manager.py.
 set "FT_GRAPH_MAX_BS=0"
+rem 2026-11-05: graphs in hybrid decode via the kernel spin-wait handshake. Run with an argument to set the
+rem ladder top, e.g. FreeToken-Desktop-021.cmd 1 (FreeToken-Desktop-021-graphs.cmd does that). Undo: no argument.
+if not "%~1"=="" set "FT_GRAPH_MAX_BS=%~1"
 rem Diagnostic 2026-11-03: serialize kernels so a GPU fault names the real kernel. Slow; remove after.
 rem Off since 2026-11-03 22:41 (hybrid works); remove "rem " to turn back on for debugging.
 rem set "AMD_SERIALIZE_KERNEL=3"

@@ -20,9 +20,14 @@ class KernelIo {
   void publish(uintptr_t stream, const void* x, const int32_t* ids, const float* w, int num_tokens, uint64_t task);
   // Follows gpu_wait(): writes the CPU rows to out [n, hidden] bf16, or adds them to it; a skipped step gives zeros.
   void combine(uintptr_t stream, void* out, int num_tokens, bool accumulate);
+  // ROCm Windows fork: gpu_wait() without stream memops, a one-thread kernel spinning on done (graph-safe).
+  void wait(uintptr_t stream);
 
   // Whether both kernels run and write the right words on this device: "" or the reason.
   static std::string probe(uintptr_t stream);
+  // ROCm Windows fork test: publish kernel + a kernel spin-wait on done (no memops), captured into a graph and replayed
+  // `replays` times against a CPU responder thread (graph=false: eager launches). Returns a one-line report.
+  static std::string graph_probe(int replays, bool flush, bool graph);
 
  private:
   volatile int64_t* ready_;

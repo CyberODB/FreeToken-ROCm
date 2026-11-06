@@ -27,5 +27,6 @@ if /i "%~1"=="serve" goto :serve
 exit /b %ERRORLEVEL%
 :serve
 set "ARGS=%ARGS:~5%"
-"%REPO%\.venv\Scripts\ft.exe" serve --cuda-graph-max-bs 0 %ARGS%
+if not defined FT_GRAPH_MAX_BS set "FT_GRAPH_MAX_BS=0"
+"%REPO%\.venv\Scripts\ft.exe" serve --cuda-graph-max-bs %FT_GRAPH_MAX_BS% %ARGS%
 exit /b %ERRORLEVEL%

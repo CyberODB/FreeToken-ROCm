@@ -10,6 +10,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -59,6 +61,7 @@ bool capturing(hipStream_t stream) {
 // Whether this runtime records a native hipStreamWriteValue64 issued under capture as a graph node.
 bool records_native_memops() {
   static const bool native = [] {
+    if (std::getenv("FREETOKEN_CPU_MOE_EXPLICIT_NODES") != nullptr) return false;  // ROCm Windows fork test knob
     ProbeErrorScope errors;
     uint64_t* word = nullptr;
     hipStream_t stream = nullptr;
@@ -185,12 +188,18 @@ GpuSync::~GpuSync() {
 
 bool GpuSync::probe(uintptr_t /*stream*/) {
   ProbeErrorScope errors;
+  // ROCm Windows fork 2026-11-05: FREETOKEN_CPU_MOE_PROBE_DEBUG=1 prints which probe step failed.
+  const bool debug = std::getenv("FREETOKEN_CPU_MOE_PROBE_DEBUG") != nullptr;
   int device = 0;
   int can_wait = 0;
-  if (hipGetDevice(&device) != hipSuccess ||
-      hipDeviceGetAttribute(&can_wait, hipDeviceAttributeCanUseStreamWaitValue, device) != hipSuccess || can_wait == 0)
+  hipError_t attr_rc = hipGetDevice(&device);
+  if (attr_rc == hipSuccess) attr_rc = hipDeviceGetAttribute(&can_wait, hipDeviceAttributeCanUseStreamWaitValue, device);
+  if (attr_rc != hipSuccess || can_wait == 0) {
+    if (debug) std::fprintf(stderr, "[memops-probe] CanUseStreamWaitValue=%d rc=%s\n", can_wait, hipGetErrorString(attr_rc));
     return false;
+  }
   const bool explicit_nodes = !records_native_memops();
+  const char* step = "alloc/stream";
 
   uint64_t* ready = nullptr;
   uint64_t* done = nullptr;
@@ -205,18 +214,18 @@ bool GpuSync::probe(uintptr_t /*stream*/) {
   if (rc == hipSuccess) __atomic_store_n(done, 1ULL, __ATOMIC_RELEASE);
   if (rc == hipSuccess) rc = hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed);
   const bool capture_started = rc == hipSuccess;
-  if (rc == hipSuccess) rc = write_value(stream, ready, 1, explicit_nodes ? &node_ops[0] : nullptr);
-  if (rc == hipSuccess) rc = wait_done(stream, done, explicit_nodes ? &node_ops[1] : nullptr);
+  if (rc == hipSuccess && (step = "write_value under capture")) rc = write_value(stream, ready, 1, explicit_nodes ? &node_ops[0] : nullptr);
+  if (rc == hipSuccess && (step = "wait_done under capture")) rc = wait_done(stream, done, explicit_nodes ? &node_ops[1] : nullptr);
   // End the capture even on failure so its stream and graph are not left active during cleanup.
   if (capture_started) {
     const hipError_t end_rc = hipStreamEndCapture(stream, &graph);
-    if (rc == hipSuccess) rc = end_rc;
+    if (rc == hipSuccess && (step = "end capture")) rc = end_rc;
   }
-  if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
+  if (rc == hipSuccess && (step = "sync after capture")) rc = hipStreamSynchronize(stream);
   size_t nodes = 0;
-  if (rc == hipSuccess) rc = hipGraphGetNodes(graph, nullptr, &nodes);
-  if (rc == hipSuccess && nodes != 2) rc = hipErrorNotSupported;
-  if (rc == hipSuccess) rc = hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
+  if (rc == hipSuccess && (step = "get nodes")) rc = hipGraphGetNodes(graph, nullptr, &nodes);
+  if (rc == hipSuccess && nodes != 2 && (step = "node count != 2")) rc = hipErrorNotSupported;
+  if (rc == hipSuccess && (step = "instantiate")) rc = hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
 
   bool served = false;
   if (rc == hipSuccess) {
@@ -230,11 +239,51 @@ bool GpuSync::probe(uintptr_t /*stream*/) {
       // The probe graph never resets done, so this also releases a launch that arrives after the deadline.
       __atomic_store_n(done, 1ULL, __ATOMIC_RELEASE);
     });
+    step = "graph launch";
     rc = hipGraphLaunch(graph_exec, stream);
-    if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
+    if (rc == hipSuccess && std::getenv("FREETOKEN_CPU_MOE_FLUSH") != nullptr) (void)hipStreamQuery(stream);
+    if (rc == hipSuccess && (step = "sync after launch")) rc = hipStreamSynchronize(stream);
     responder.join();
+    if (rc == hipSuccess && !served) step = "replay never raised ready (2 s)";
   }
   const bool ok = rc == hipSuccess && served;
+  if (debug)
+    std::fprintf(stderr, "[memops-probe] %s: explicit_nodes=%d nodes=%zu served=%d last step '%s' rc=%s\n", ok ? "OK" : "FAILED",
+                 explicit_nodes ? 1 : 0, nodes, served ? 1 : 0, step, hipGetErrorString(rc));
+  if (debug && ready != nullptr) {
+    std::fprintf(stderr, "[memops-probe] ready word after replay+sync = %llu (1 = the write landed, only late)\n",
+                 static_cast<unsigned long long>(__atomic_load_n(ready, __ATOMIC_ACQUIRE)));
+    // Eager writes (no graph): does the CPU see a stream write before the stream is synced?
+    auto eager = [&](uint64_t* word, const char* kind, bool flush) {
+      __atomic_store_n(word, 0ULL, __ATOMIC_RELEASE);
+      hipStream_t s2 = nullptr;
+      hipError_t e = hipStreamCreateWithFlags(&s2, hipStreamNonBlocking);
+      if (e == hipSuccess) e = hipStreamWriteValue64(s2, word, 5, hipStreamWriteValueDefault);
+      if (e == hipSuccess && flush) (void)hipStreamQuery(s2);
+      const auto t0 = std::chrono::steady_clock::now();
+      double seen_ms = -1;
+      while (e == hipSuccess && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1)) {
+        if (__atomic_load_n(word, __ATOMIC_ACQUIRE) == 5) {
+          seen_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+          break;
+        }
+        std::this_thread::yield();
+      }
+      if (s2 != nullptr) {
+        (void)hipStreamSynchronize(s2);
+        (void)hipStreamDestroy(s2);
+      }
+      std::fprintf(stderr, "[memops-probe] eager write to %s%s: rc=%s, CPU saw it after %.3f ms before sync (-1 = never), value after sync %llu\n",
+                   kind, flush ? " + hipStreamQuery" : "", hipGetErrorString(e), seen_ms, static_cast<unsigned long long>(__atomic_load_n(word, __ATOMIC_ACQUIRE)));
+    };
+    eager(ready, "signal memory", false);
+    eager(ready, "signal memory", true);
+    void* host = nullptr;
+    if (hipHostMalloc(&host, sizeof(uint64_t), hipHostMallocCoherent | hipHostMallocMapped) == hipSuccess) {
+      eager(static_cast<uint64_t*>(host), "coherent host memory", true);
+      (void)hipHostFree(host);
+    }
+  }
 
   if (graph_exec != nullptr) (void)hipGraphExecDestroy(graph_exec);
   if (graph != nullptr) (void)hipGraphDestroy(graph);
