@@ -19,10 +19,10 @@ set "TVM_FFI_CACHE_DIR=%SRC%\.tvm-ffi-cache"
 set "PATH=%ROCM%\bin;%REPO%\.venv\Lib\site-packages\_rocm_sdk_libraries\bin;%REPO%\.venv\Scripts;%PATH%"
 set "CC=%ROCM%\lib\llvm\bin\clang-cl.exe"
 set "FREETOKEN_FT_BIN=%SRC%\bin\ft.cmd"
-rem CUDA graph ladder for the daemon: 0 = off, then 1, 2, 4. See serve_manager.py.
-set "FT_GRAPH_MAX_BS=0"
-rem 2026-11-05: graphs in hybrid decode via the kernel spin-wait handshake. Run with an argument to set the
-rem ladder top, e.g. FreeToken-Desktop-021.cmd 1 (FreeToken-Desktop-021-graphs.cmd does that). Undo: no argument.
+rem CUDA graph ladder for the daemon: 0 = off, then 1, 2, 4. See serve_manager.py. Default 1 since 2026-11-05.
+set "FT_GRAPH_MAX_BS=1"
+rem 2026-11-05: graphs in hybrid decode via the kernel spin-wait handshake (test B: 47-58 tok/s vs 12-14.5 off).
+rem An argument sets the ladder top: FreeToken-Desktop-021.cmd 0 turns graphs off.
 if not "%~1"=="" set "FT_GRAPH_MAX_BS=%~1"
 rem Diagnostic 2026-11-03: serialize kernels so a GPU fault names the real kernel. Slow; remove after.
 rem Off since 2026-11-03 22:41 (hybrid works); remove "rem " to turn back on for debugging.
