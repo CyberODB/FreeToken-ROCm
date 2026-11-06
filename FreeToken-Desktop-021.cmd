@@ -41,7 +41,7 @@ rem set "FREETOKEN_HYBRID_TIMING=16"
 rem set "FREETOKEN_HYBRID_OVERLAP=0"
 rem Measurement 2026-11-04: time 32 decode steps once (after 24 warm-up steps): CPU enqueue vs GPU finish,
 rem logged in serve-1919.log as [decode-profile]. FREETOKEN_DECODE_PROFILE_MODE=torch gives the torch.profiler table instead.
-set "FREETOKEN_DECODE_PROFILE=32"
+rem set "FREETOKEN_DECODE_PROFILE=32"
 powershell -NoProfile -ExecutionPolicy Bypass -File "E:\freetoken-rocm\guard-daemon.ps1" -Build "TEST" || exit /b 1
 rem freetoken-desktop-test.exe is a patched copy (orange tray icon, "FreeToken TEST" label) made by
 rem E:\freetoken-rocm\patch_tray.py. It gets no app updates: re-run the patch after updating FreeToken Desktop.
