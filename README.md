@@ -15,6 +15,36 @@
 > parts of it are re-applied here on top of v0.2.1, with Windows daemon, launcher and RX 9070 fixes
 > by CyberODB, made with help from Claude. The older port with Maxritz's full history is on `main`.
 
+## Windows + ROCm milestones (this branch)
+
+Measured on an AMD Radeon RX 9070 (gfx1201, 16 GB), Windows 11, 32 GB RAM, model on a SATA SSD,
+with HauhauCS Qwen3.6-35B-A3B IQ4_NL GGUF in hybrid MoE mode (experts in host RAM, run on the CPU and GPU).
+
+| What | Before | After |
+|---|---|---|
+| Hybrid decode (HIP graphs, batch 1) | 12-14.5 tok/s, graphs forced off | **47-58 tok/s**, output coherent |
+| Expert banks load (16.9 GiB) | 86-87 s at ~210 MiB/s | **35 s** at 443-447 MiB/s |
+| GGUF header parse (model file) | 10.7-11.4 s, run 3 times per launch | **1.2 s**, parsed once per process |
+| Server argument parsing | 10.6 s | **1.6-1.9 s** |
+| `transformers` package scan at import, per process | 2.85 s | **0.16 s** |
+| Dense + vision weights, cold disk (2.37 GiB) | 11.1 s | **7.4 s** |
+
+- **HIP graphs in hybrid decode.** On Windows ROCm, stream memory-op graph nodes never run on replay, so the
+  CPU-MoE handshake fell back to host callbacks and graphs were turned off. A one-thread GPU kernel now spins
+  on the CPU's done flag instead, which is graph-safe. Graphs are on by default at batch 1. Turn them off
+  with `FT_GRAPH_MAX_BS=0`, or `FreeToken-Desktop-021.cmd 0`. `FREETOKEN_CPU_MOE_KERNEL_WAIT=0` opts out of
+  the kernel wait.
+- **Threaded expert bank reads.** Windows has no `O_DIRECT` or `preadv`, so the banks were filled from the
+  file mmap one page fault at a time. 8 threads now read each expert's rows straight into the pinned bank.
+  `FREETOKEN_GGUF_READ_THREADS=0` restores the mmap copy.
+- **Faster startup.** The vendored gguf reader indexes a plain ndarray view of the file map and reads the
+  tokenizer's string arrays without recursing per item. `freetoken._fast_metadata` gives transformers a
+  `packages_distributions()` that skips ~26k file `stat` calls. 8 background threads read the dense
+  weights ahead of the loader; `FREETOKEN_GGUF_PREFETCH_THREADS=0` turns that off. Parsed metadata,
+  package mappings and loaded bytes were checked identical to the old code paths.
+- The threaded reads, the prefetch and the metadata patch are off outside Windows. The kernel wait only
+  runs on HIP when the memory-op probe fails.
+
 <p align="center">
 | <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/issues/482"><b>Community WeChat</b></a> |
 </p>
