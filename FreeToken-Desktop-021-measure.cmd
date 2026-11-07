@@ -11,6 +11,7 @@ setlocal
 set "MODE=%~1"
 if "%MODE%"=="" set "MODE=stamps"
 set "FT_MEASURE_ARGS="
+set "FT_GUARD_NAME=measure-%MODE%"
 if /i "%MODE%"=="off" goto run
 set "FREETOKEN_GRAPH_STAMPS=64"
 if /i "%MODE%"=="stamps" goto run

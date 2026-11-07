@@ -56,6 +56,13 @@ rem Measurement 2026-11-06: in-graph GPU timestamps, [graph-stamps] in serve-191
 rem ms per phase (summed over layers), host gap, hits / PCIe fetches / CPU routes per layer. Graphs stay on.
 rem Adds ~200 tiny kernels per step, so compare tok/s with it off. Remove "rem " to turn on.
 rem set "FREETOKEN_GRAPH_STAMPS=64"
+rem 2026-11-07: GPU guard for every test (scripts\gpu-guard.py). --check refuses a test that was running when the PC died;
+rem the hidden watcher kills the FreeToken GPU processes if free VRAM stays under FT_GUARD_MIN_FREE_GIB (default 1.0) and
+rem journals VRAM to FT_GUARD_DIR so a hard reset leaves a trail. A launcher may set FT_GUARD_NAME first. Undo: delete these 7 lines.
+set "FT_GUARD_DIR=T:\robot\state\gpu-guard"
+if not defined FT_GUARD_NAME set "FT_GUARD_NAME=desktop-graphs%FT_GRAPH_MAX_BS%"
+python "%SRC%\scripts\gpu-guard.py" --check --name "%FT_GUARD_NAME%" || (pause & exit /b 1)
+start "" /b pythonw "%SRC%\scripts\gpu-guard.py" --watch --name "%FT_GUARD_NAME%"
 powershell -NoProfile -ExecutionPolicy Bypass -File "E:\freetoken-rocm\guard-daemon.ps1" -Build "TEST" || exit /b 1
 rem freetoken-desktop-test.exe is a patched copy (orange tray icon, "FreeToken TEST" label) made by
 rem E:\freetoken-rocm\patch_tray.py. It gets no app updates: re-run the patch after updating FreeToken Desktop.
