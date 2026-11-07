@@ -117,6 +117,23 @@ def resident_expert_bank(info: GgufTensorInfo, device: torch.device) -> torch.Te
     return bank
 
 
+_Q8_0 = 8  # GGML_TYPE_Q8_0
+
+
+def _q8_0_row(k: int) -> int:
+    return k // 32 * 34
+
+
+def _q8_0_rows(rows: torch.Tensor, info: GgufTensorInfo) -> torch.Tensor:
+    """[E, rows, row_bytes] of one stacked expert tensor, requantized to Q8_0 a few experts at a time."""
+    from freetoken.layers.quantization.moe.gguf import _to_q8_0
+
+    out = torch.empty(rows.shape[0], rows.shape[1], _q8_0_row(info.ne[0]), dtype=torch.uint8)
+    for e in range(0, rows.shape[0], 16):
+        out[e : e + 16].copy_(_to_q8_0(rows[e : e + 16], info.ggml_type, info.ne[0]))
+    return out
+
+
 def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts: int) -> torch.Tensor:
     """[E, 4] fp32 (gate, up, down, 1) weight_scale_2 of one layer's experts."""
     gate, up = gate_up if len(gate_up) == 2 else (gate_up[0], gate_up[0])
@@ -159,11 +176,14 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 parts = [gate]
             else:
                 gate, up = index[f"{blk}.ffn_gate_exps.weight"], index[f"{blk}.ffn_up_exps.weight"]
-                if gate.ggml_type != up.ggml_type:
-                    raise NotImplementedError(f"{blk}: gate and up experts have different ggml types")
+                if gate.ggml_type != up.ggml_type and float_dtype(gate.ggml_type) is not None and float_dtype(up.ggml_type) is not None:
+                    raise NotImplementedError(f"{blk}: gate and up experts have different float types")
                 parts = [gate, up]
-            tags.append(("ggml", type_name(gate.ggml_type), type_name(down.ggml_type)))
-            tails["gate_up"].append(mmq_tail_bytes(gate.ggml_type, gate.ne[0]))
+            # gate and up in different ggml types (REAP-pruned files): that layer's gate_up bank is requantized to Q8_0
+            promote = len(parts) == 2 and parts[0].ggml_type != parts[1].ggml_type
+            gu_type = _Q8_0 if promote else gate.ggml_type
+            tags.append(("ggml", type_name(gu_type), type_name(down.ggml_type)))
+            tails["gate_up"].append(mmq_tail_bytes(gu_type, gate.ne[0]))
             tails["down"].append(mmq_tail_bytes(down.ggml_type, down.ne[0]))
             if scaled:
                 tails["global"].append(0)
@@ -173,6 +193,10 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             # a whole-layer float layer runs the bf16 fused MoE; a mixed float/quant layer keeps the float half's own dtype
             pure_float = float_dtype(gate.ggml_type) is not None and float_dtype(down.ggml_type) is not None
             rows = [_expert_rows(info) for info in parts]
+            if promote and not dummy:
+                rows = [_q8_0_rows(r, info) for r, info in zip(rows, parts)]
+            elif promote:
+                rows = [torch.empty(r.shape[0], r.shape[1], _q8_0_row(info.ne[0]), dtype=torch.uint8) for r, info in zip(rows, parts)]
             d = _expert_rows(down)
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
@@ -185,7 +209,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 banks = {role: bank.tensor for role, bank in host.items()}
             else:
                 banks = {
-                    "gate_up": _device_bank(gate_up_shape, gate.ggml_type, gate.ne[0], gu_dtype, device),
+                    "gate_up": _device_bank(gate_up_shape, gu_type, gate.ne[0], gu_dtype, device),
                     "down": _device_bank(tuple(d.shape), down.ggml_type, down.ne[0], down_dtype, device),
                 }
                 if scaled:
@@ -220,7 +244,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 start = 0
                 for info, r in zip(parts, rows):
                     dst = banks["gate_up"][:, start : start + r.shape[1]]
-                    if reader is not None and dst.dtype == r.dtype:
+                    if reader is not None and dst.dtype == r.dtype and not promote:
                         _read_rows(reader, info, dst)
                     else:
                         dst.copy_(r)

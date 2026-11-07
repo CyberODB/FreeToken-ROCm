@@ -29,11 +29,45 @@ def fused_glu(layer) -> tuple[str, float] | None:
     return None
 
 
+Q8_0 = 8  # GGML_TYPE_Q8_0
+_promoted_logged: set[tuple[int, int]] = set()
+
+
 def expert_types(cfg: MoEConfig) -> tuple[int, int]:
+    """(gate_up bank type, down bank type). A layer whose gate and up types differ (e.g. REAP-48 v2: IQ3_S gate,
+    IQ4_XS up) has no single gate_up row type, so both halves load as Q8_0: ``pack`` requantizes them
+    (near-lossless against the file's values) and every kernel, slot pool and the CPU executor see a Q8_0 bank."""
     gate, up, down = gguf_types(cfg.scheme)
     if gate != up:
-        raise NotImplementedError(f"GGUF experts with gate {type_name(gate)} and up {type_name(up)} need one gate_up bank type")
+        if not (is_quantized(gate) or is_quantized(up)):
+            raise NotImplementedError(f"GGUF experts with float gate {type_name(gate)} and up {type_name(up)} need one gate_up bank type")
+        if (gate, up) not in _promoted_logged:
+            _promoted_logged.add((gate, up))
+            import logging
+            logging.getLogger(__name__).warning(
+                "GGUF experts with gate %s and up %s: that layer's gate_up bank loads as Q8_0", type_name(gate), type_name(up))
+        return Q8_0, down
     return gate, down
+
+
+def _to_q8_0(piece: torch.Tensor, src: int, k: int) -> torch.Tensor:
+    """Rows of ``src`` (quantized bytes [..., row_bytes] or a float tensor [..., k]) as Q8_0 rows [..., row_bytes(Q8_0, k)],
+    as ggml's quantize_row_q8_0_ref: per 32 values d = amax / 127 (stored fp16), q = round(x / d)."""
+    from freetoken.kernel import ggml
+
+    lead = piece.shape[:-1]
+    dev = torch.device("cuda") if torch.cuda.is_available() else piece.device
+    if is_quantized(src):
+        x = ggml.dequantize(piece.to(dev).contiguous(), src, k, torch.float32)
+    else:
+        x = piece.to(dev, torch.float32).reshape(-1, k)
+    b = x.view(-1, k // 32, 32)
+    d = b.abs().amax(-1, keepdim=True) / 127.0
+    inv = torch.where(d > 0, 1.0 / d, torch.zeros_like(d))
+    v = b * inv
+    q = (torch.sign(v) * torch.floor(v.abs() + 0.5)).to(torch.int8)  # roundf: half away from zero
+    out = torch.cat([d.to(torch.float16).view(torch.uint8), q.view(torch.uint8)], -1)  # block: fp16 d, 32 x int8
+    return out.reshape(*lead, row_bytes(Q8_0, k)).to(piece.device)
 
 
 def _bank_spec(ggml_type: int, rows: int, k: int, bf16: bool) -> BankSpec:
@@ -101,8 +135,13 @@ class GgmlMoEKernel(MoEKernel):
 
     def pack(self, pieces, cfg: MoEConfig, out):
         i = cfg.local_intermediate
-        out["gate_up"][:, :i].copy_(pieces["gate"])
-        out["gate_up"][:, i:].copy_(pieces["up"])
+        gate, up, _ = gguf_types(cfg.scheme)
+        if gate != up:  # see expert_types: both halves requantized to the bank's Q8_0
+            out["gate_up"][:, :i].copy_(_to_q8_0(pieces["gate"], gate, cfg.hidden))
+            out["gate_up"][:, i:].copy_(_to_q8_0(pieces["up"], up, cfg.hidden))
+        else:
+            out["gate_up"][:, :i].copy_(pieces["gate"])
+            out["gate_up"][:, i:].copy_(pieces["up"])
         out["down"].copy_(pieces["down"])
         return {}
 
