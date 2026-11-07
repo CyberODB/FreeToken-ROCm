@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 from freetoken.layers import (
     BaseOP,
@@ -14,6 +16,12 @@ from freetoken.layers import (
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+# FREETOKEN_SHARED_GATE_PAD=0 turns this off. The shared-expert gate is a 1-row GEMV; hipBLAS on gfx1201
+# runs that ~2x slower than 16 rows, so the weight is padded with 15 zero rows and column 0 is kept.
+# Bit-identical output (ROCm fork, phase 4, 2026-11-07).
+_GATE_PAD = os.environ.get("FREETOKEN_SHARED_GATE_PAD", "1") != "0"
 
 
 class _SharedExpert(BaseOP):
@@ -68,6 +76,7 @@ class Qwen3_5MoE(BaseOP):
             prefix=f"{prefix}.shared_expert",
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
+        self._gate_pad_w: torch.Tensor | None = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -77,9 +86,18 @@ class Qwen3_5MoE(BaseOP):
         # shared expert's input (HF also evaluates the shared expert first).
         router_logits = self.gate.forward(hidden_states)
         shared = self.shared_expert.forward(hidden_states)
-        shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+        shared = shared * torch.sigmoid(self._shared_gate(hidden_states))
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return (routed + shared).view(num_tokens, hidden_dim)
+
+    def _shared_gate(self, x: torch.Tensor) -> torch.Tensor:
+        g = getattr(self.shared_expert_gate, "weight", None)
+        if not _GATE_PAD or g is None or g.dim() != 2 or g.shape[0] != 1 or g.dtype != x.dtype:
+            return self.shared_expert_gate.forward(x)
+        w = self._gate_pad_w
+        if w is None or w.device != g.device:
+            w = self._gate_pad_w = torch.cat([g, g.new_zeros(15, g.shape[1])], 0).contiguous()
+        return torch.nn.functional.linear(x, w)[:, :1]
 
 
 __all__ = ["Qwen3_5MoE", "Qwen3_5DenseMLP"]
