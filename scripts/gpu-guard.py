@@ -23,10 +23,23 @@ Rules:
     Kernel-Power event 41 (unclean shutdown) after the last sample, that test is a suspected
     killer and --check refuses it until --force or --clear. A clean restart is not blamed.
 Journal and killer list: $FT_GUARD_DIR (default %LOCALAPPDATA%\\freetoken-gpu-guard).
+Profiles (--profile or env FT_GUARD_PROFILE, default "debug"; explicit flags/env below still override a profile):
+  debug   strict, for GPU/expert/layer debugging where a crash is likely: free VRAM 0.2, RAM 1.5, commit 2.0 GiB, 2 samples
+  normal  everyday model serving (Hermes chat): VRAM 0.15, RAM 0.4, commit 0.75 GiB, 4 samples in a row (fires less);
+          plus a soft RAM floor of 1.0 GiB that only counts while Pages Input/sec >= 2000 (real paging, not just low RAM)
 Env: FT_GUARD_MIN_FREE_GIB (0.4), FT_GUARD_MIN_RAM_GIB (1.5), FT_GUARD_MIN_COMMIT_GIB (2.0), FT_GUARD_SAMPLES (2),
      FT_GUARD_STALE ("--port 1925"), FT_GUARD_TOTAL_GIB (16), FT_GUARD_MATCH ("freetoken").
 """
 import argparse, csv, io, json, os, subprocess, sys, threading, time
+
+PROFILES = {  # floors (GiB) and samples in a row; "debug" = the original behaviour
+    "debug":  dict(free=0.2,  ram=1.5, commit=2.0,  samples=2, soft=0.0, page_in=0),  # VRAM 0.2: this model sits at ~0.33 free by design; 0.4 killed it in a loop
+    # RAM 0.4 (was 1.0): the 35B hybrid model idles at only 1.1-2.0 GiB available and a Hermes prefill dips to ~0.65, so 1.0
+    # killed healthy runs 20+ times on 2026-11-08 (commit free was ~11 GiB and the sampler never stalled). Undo: ram=1.0, samples=3.
+    # soft=1.0/page_in=2000: below 1.0 GiB available RAM only counts as a breach while the box is also paging in (>2000 pages/s,
+    # i.e. real thrash); ram=0.4 stays as the hard floor with no paging test. Undo: soft=0.0.
+    "normal": dict(free=0.15, ram=0.4, commit=0.75, samples=4, soft=1.0, page_in=2000),
+}
 
 DIR = os.environ.get("FT_GUARD_DIR") or os.path.join(
     os.environ.get("LOCALAPPDATA", "."), "freetoken-gpu-guard")
@@ -118,9 +131,9 @@ def resolve_unclean():
 
 
 def sample_stream(si=1):
-    """Yield (used dedicated VRAM bytes of the busiest adapter, available RAM GiB, free commit GiB) every si s."""
+    """Yield (used dedicated VRAM bytes of the busiest adapter, available RAM GiB, free commit GiB, pages read in/s) every si s."""
     p = subprocess.Popen(["typeperf", r"\GPU Adapter Memory(*)\Dedicated Usage", r"\Memory\Available MBytes",
-                          r"\Memory\Committed Bytes", r"\Memory\Commit Limit", "-si", str(si)],
+                          r"\Memory\Committed Bytes", r"\Memory\Commit Limit", r"\Memory\Pages Input/sec", "-si", str(si)],
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                          creationflags=NOWIN)
     hdr = None
@@ -133,12 +146,12 @@ def sample_stream(si=1):
             if hdr is None:
                 hdr = row
                 gi = [i for i, h in enumerate(hdr) if "GPU Adapter Memory" in h]
-                ai, ci, li = (next(i for i, h in enumerate(hdr) if h.endswith(s))
-                              for s in ("Available MBytes", "Committed Bytes", "Commit Limit"))
+                ai, ci, li, pi = (next(i for i, h in enumerate(hdr) if h.endswith(s))
+                                  for s in ("Available MBytes", "Committed Bytes", "Commit Limit", "Pages Input/sec"))
                 continue
             try:
                 yield (max(float(row[i]) for i in gi if row[i].strip()), float(row[ai]) / 1024,
-                       (float(row[li]) - float(row[ci])) / GIB)
+                       (float(row[li]) - float(row[ci])) / GIB, float(row[pi]))
             except (ValueError, IndexError):
                 continue
     finally:
@@ -153,10 +166,12 @@ class Limits:
     def __init__(self, a):
         self.a, self.low = a, 0
 
-    def check(self, used, avail, cfree):
+    def check(self, used, avail, cfree, pin=0.0):
         a, free = self.a, self.a.total_gib - used / GIB
+        soft = a.soft_ram_gib and avail < a.soft_ram_gib and pin >= a.page_in  # low RAM AND thrashing, not just low
         why = (f"free VRAM {free:.2f} GiB under {a.min_free_gib}" if free < a.min_free_gib else
                f"available RAM {avail:.2f} GiB under {a.min_ram_gib}" if avail < a.min_ram_gib else
+               f"available RAM {avail:.2f} GiB under {a.soft_ram_gib} while paging in {pin:.0f} pages/s" if soft else
                f"free commit {cfree:.2f} GiB under {a.min_commit_gib}" if cfree < a.min_commit_gib else None)
         self.low = self.low + 1 if why else 0
         return why if self.low >= a.samples else None
@@ -180,7 +195,7 @@ def kill_pids(pids):
 def wait_recovered(pids, base_used, timeout=45):
     """After a kill: wait until the PIDs are gone and VRAM is back near the pre-run level. Returns seconds or None."""
     t0 = time.time()
-    for used, _, _ in sample_stream():
+    for used, _, _, _ in sample_stream():
         if not any(pid_alive(p) for p in pids) and used / GIB < base_used + 0.75:
             return round(time.time() - t0, 1)
         if time.time() - t0 > timeout:
@@ -204,14 +219,18 @@ def ft_gpu_pids(match):
             pass
     me = os.getpid()
     js = ps("Get-CimInstance Win32_Process | ? { $_.CommandLine } | "
-            "select ProcessId,CommandLine | ConvertTo-Json -Compress")
+            "select ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress")
     procs = json.loads(js or "[]")
     procs = procs if isinstance(procs, list) else [procs]
+    # 2026-11-07: ft serve's engine runs in a multiprocessing child whose command line has no "freetoken" in it
+    # ("spawn_main(parent_pid=...)"), and that child holds the VRAM. Count every descendant of a matching process too.
+    ok = {p["ProcessId"] for p in procs
+          if match.lower() in p["CommandLine"].lower() and "gpu-guard" not in p["CommandLine"].lower()}
+    for _ in range(6):
+        ok |= {p["ProcessId"] for p in procs if p["ParentProcessId"] in ok}
     hits = []
     for p in procs:
-        c = p["CommandLine"].lower()
-        if (match.lower() in c and "gpu-guard" not in c and p["ProcessId"] != me
-                and used.get(p["ProcessId"], 0) > 0):
+        if p["ProcessId"] in ok and p["ProcessId"] != me and used.get(p["ProcessId"], 0) > 0:
             hits.append((p["ProcessId"], used[p["ProcessId"]]))
     return hits
 
@@ -226,28 +245,57 @@ def kill_ft(match, name, why):
     return bool(hits)
 
 
-def jsample(name, a, lastw, used, avail, cfree, now):
+def jsample(name, a, lastw, used, avail, cfree, now, pin=0.0):
     """Journal a sample when it moved, every 10 s, or near a floor (fsynced, survives a hard reset)."""
     used_g, free = used / GIB, a.total_gib - used / GIB
-    near = free < a.min_free_gib + 1 or avail < a.min_ram_gib + 2 or cfree < a.min_commit_gib + 2
+    near = free < a.min_free_gib + 1 or avail < max(a.min_ram_gib, a.soft_ram_gib) + 2 or cfree < a.min_commit_gib + 2
     if abs(used_g - lastw[0]) > 0.05 or abs(avail - lastw[2]) > 0.5 or now - lastw[1] >= 10 or near:
         jwrite(ev="vram", name=name, used_gib=round(used_g, 2), free_gib=round(free, 2),
-               ram_gib=round(avail, 2), commit_gib=round(cfree, 2))
+               ram_gib=round(avail, 2), commit_gib=round(cfree, 2), pagein=round(pin))
         return (used_g, now, avail)
     return lastw
 
 
+def override_profile():
+    """Profile a caller asked for through DIR/profile.override ({"profile":"debug","pid":N,"until":epoch}); None = no request.
+    Active while its pid is alive and its `until` has not passed, so a crashed bench cannot leave the strict profile on."""
+    try:
+        d = json.load(open(os.path.join(DIR, "profile.override"), encoding="utf-8"))
+        if d.get("profile") not in PROFILES: return None
+        if d.get("until") and time.time() > float(d["until"]): return None
+        pid = d.get("pid")
+        if pid and ps("@(Get-Process -Id %d -ErrorAction SilentlyContinue).Count" % int(pid)) in ("", "0"): return None
+        return d["profile"]
+    except Exception:
+        return None
+
+
+def apply_profile(a, prof, explicit=()):
+    p = PROFILES[prof]
+    a.min_free_gib, a.min_ram_gib, a.min_commit_gib, a.samples = p["free"], p["ram"], p["commit"], p["samples"]
+    a.soft_ram_gib, a.page_in = p["soft"], p["page_in"]
+    a.profile = prof
+
+
 def watch(name, a, grace=600, idle_exit=300):
     match = a.match
-    jwrite(ev="start", name=name, pid=os.getpid(), boot=boot_id(), floor_gib=a.min_free_gib,
-           ram_floor_gib=a.min_ram_gib, commit_floor_gib=a.min_commit_gib)
+    base_prof, last_ov = a.profile, 0.0
+    jwrite(ev="start", name=name, pid=os.getpid(), boot=boot_id(), profile=a.profile, floor_gib=a.min_free_gib,
+           ram_floor_gib=a.min_ram_gib, commit_floor_gib=a.min_commit_gib, samples=a.samples)
     t0 = last_seen = last_check = time.time()
     lim = Limits(a)
     lastw = (0.0, 0.0, 0.0)  # (used_gib, time, ram_gib) of the last journal sample
-    for used, avail, cfree in sample_stream():
+    for used, avail, cfree, pin in sample_stream():
         now = time.time()
-        lastw = jsample(name, a, lastw, used, avail, cfree, now)
-        why = lim.check(used, avail, cfree)
+        if now - last_ov >= 3:  # a bench or OpenFT asks for the strict profile through profile.override
+            last_ov = now
+            want = override_profile() or base_prof
+            if want != a.profile:
+                old = a.profile; apply_profile(a, want); lim.low = 0
+                jwrite(ev="profile", name=name, was=old, now=want, floor_gib=a.min_free_gib,
+                       ram_floor_gib=a.min_ram_gib, commit_floor_gib=a.min_commit_gib, samples=a.samples)
+        lastw = jsample(name, a, lastw, used, avail, cfree, now, pin)
+        why = lim.check(used, avail, cfree, pin)
         if why:
             kill_ft(match, name, why)
             lim.low = 0
@@ -270,13 +318,19 @@ def main():
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--clear")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default=os.environ.get("FT_GUARD_PROFILE", "debug"),
+                    help="debug (strict, default) or normal (everyday serving; fires less)")
+    prof = PROFILES[ap.parse_known_args()[0].profile]
     ap.add_argument("--min-free-gib", type=float,
-                    default=float(os.environ.get("FT_GUARD_MIN_FREE_GIB", "0.4")))
+                    default=float(os.environ.get("FT_GUARD_MIN_FREE_GIB", prof["free"])))
     ap.add_argument("--min-ram-gib", type=float,
-                    default=float(os.environ.get("FT_GUARD_MIN_RAM_GIB", "1.5")))
+                    default=float(os.environ.get("FT_GUARD_MIN_RAM_GIB", prof["ram"])))
+    ap.add_argument("--soft-ram-gib", type=float, default=float(os.environ.get("FT_GUARD_SOFT_RAM_GIB", prof["soft"])),
+                    help="available RAM under this only counts while paging in >= --page-in pages/s (0 = off)")
+    ap.add_argument("--page-in", type=float, default=float(os.environ.get("FT_GUARD_PAGE_IN", prof["page_in"])))
     ap.add_argument("--min-commit-gib", type=float,
-                    default=float(os.environ.get("FT_GUARD_MIN_COMMIT_GIB", "2.0")))
-    ap.add_argument("--samples", type=int, default=int(os.environ.get("FT_GUARD_SAMPLES", "2")),
+                    default=float(os.environ.get("FT_GUARD_MIN_COMMIT_GIB", prof["commit"])))
+    ap.add_argument("--samples", type=int, default=int(os.environ.get("FT_GUARD_SAMPLES", prof["samples"])),
                     help="samples in a row (1 s apart) under a floor before the kill")
     ap.add_argument("--stale", default=os.environ.get("FT_GUARD_STALE", "--port 1925"),
                     help="wrap mode: kill leftover processes whose command line has this before the run "
@@ -335,10 +389,10 @@ def main():
             print(f"[gpu-guard] recovered in {s} s" if s is not None else
                   "[gpu-guard] NOT recovered after 45 s: check for leftover python processes", flush=True)
         t0, lim, lastw = time.time(), Limits(a), (0.0, 0.0, 0.0)
-        for used, avail, cfree in sample_stream():
+        for used, avail, cfree, pin in sample_stream():
             now = time.time()
-            lastw = jsample(a.name, a, lastw, used, avail, cfree, now)
-            why = lim.check(used, avail, cfree)
+            lastw = jsample(a.name, a, lastw, used, avail, cfree, now, pin)
+            why = lim.check(used, avail, cfree, pin)
             if not why and a.timeout and now - t0 > a.timeout:
                 why = f"timeout {a.timeout}s"
             if why:
