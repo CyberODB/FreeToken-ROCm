@@ -38,7 +38,7 @@ rem FT_MEASURE_ARGS comes from FreeToken-Desktop-021-measure.cmd (empty otherwis
 set "FT_EXTRA_SERVE_ARGS=--moe-cpu-layers auto %FT_MEASURE_ARGS%"
 rem Test 2026-11-06: 15 GiB (was 14): one more GiB pinned instead of locked, same total RAM. Driver refused near ~14
 rem in the 11-03 probe, so a load error here means back to 14. Undo: set back to 14.
-set "FREETOKEN_PIN_BUDGET_GB=13"
+set "FREETOKEN_PIN_BUDGET_GB=15"
 rem 2026-11-06: RAM check before each load (python\freetoken\ram_preflight.py). 14 GiB = desktop with a YouTube video
 rem and Claude running, 11.8 measured by T:\robot\tools\tools\ram-baseline.py, + 2 margin. If the model won't fit in
 rem free RAM a window says why and offers to close programs, then loads anyway. Undo: delete this line.
