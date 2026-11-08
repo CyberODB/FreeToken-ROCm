@@ -22,6 +22,7 @@ Rules:
   * A watcher session with no "end" line after a reboot is looked at: if Windows logged
     Kernel-Power event 41 (unclean shutdown) after the last sample, that test is a suspected
     killer and --check refuses it until --force or --clear. A clean restart is not blamed.
+Every kill also prints a plain-language "WHY / WHAT TO TRY" line, journals it as `tip`, and writes last-stop.txt in $FT_GUARD_DIR.
 Journal and killer list: $FT_GUARD_DIR (default %LOCALAPPDATA%\\freetoken-gpu-guard).
 Profiles (--profile or env FT_GUARD_PROFILE, default "debug"; explicit flags/env below still override a profile):
   debug   strict, for GPU/expert/layer debugging where a crash is likely: free VRAM 0.2, RAM 1.5, commit 2.0 GiB, 2 samples
@@ -235,10 +236,47 @@ def ft_gpu_pids(match):
     return hits
 
 
+def kill_hint(why):
+    """Plain-language reason and the cheapest thing to try, from a Limits.check() reason string."""
+    w = why or ""
+    if w.startswith("free VRAM"):
+        return ("The GPU ran out of free memory. Try, in order: lower the context (--max-seq-len-override) or KV (--num-pages, "
+                "--kv-reserve-tokens) first; then a smaller --moe-cache-size; then --memory-ratio down 0.05; "
+                "close apps that hold VRAM (browser hardware acceleration, games).")
+    if "while paging in" in w:
+        return ("The PC was out of RAM and swapping to disk, which is what freezes it. Try: close big apps (browser, Discord, "
+                "Claude) before loading, lower the context or KV so less is resident, or serve a smaller quant.")
+    if w.startswith("available RAM"):
+        return ("Host RAM ran critically low. Try: close big apps, lower the context or KV, or lower the pin budget "
+                "(FREETOKEN_PIN_BUDGET_GB) together with --moe-cpu-layers auto, or serve a smaller quant.")
+    if w.startswith("free commit"):
+        return "Windows ran nearly out of commit (RAM + page file). Try: close big apps or enlarge the page file."
+    if w.startswith("timeout"):
+        return "The run hit its time limit. Try: a shorter test, or check the serve log for a stuck load."
+    return None
+
+
+def note_stop(name, why, pids=None):
+    """Journal-side human note: a hint line plus last-stop.txt (the file to read when a model vanished)."""
+    tip = kill_hint(why)
+    if tip:
+        print(f"[gpu-guard] WHY / WHAT TO TRY: {tip}", flush=True)
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        with open(os.path.join(DIR, "last-stop.txt"), "w", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  guard stopped '{name}'\nWhy: {why}\n"
+                    f"{'What to try: ' + tip if tip else ''}\n")
+    except OSError:
+        pass
+    return tip
+
+
 def kill_ft(match, name, why):
     hits = ft_gpu_pids(match)
-    jwrite(ev="kill", name=name, why=why, pids=[h[0] for h in hits])
+    tip = kill_hint(why)
+    jwrite(ev="kill", name=name, why=why, pids=[h[0] for h in hits], **({"tip": tip} if tip else {}))
     print(f"[gpu-guard] KILL '{name}': {why}; pids {[h[0] for h in hits]}", flush=True)
+    note_stop(name, why)
     for pid, _ in hits:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True,
                        creationflags=NOWIN)
@@ -381,8 +419,10 @@ def main():
         def kill_tree(why):
             killed.append(why)
             pids = [proc.pid] + [p for p in stale() if p != proc.pid]  # the tree, plus a server that lost its parent
-            jwrite(ev="kill", name=a.name, why=why, pids=pids)
+            tip = kill_hint(why)
+            jwrite(ev="kill", name=a.name, why=why, pids=pids, **({"tip": tip} if tip else {}))
             print(f"[gpu-guard] KILL '{a.name}': {why}", flush=True)
+            note_stop(a.name, why)
             kill_pids(pids)
             s = wait_recovered(pids, base)
             jwrite(ev="recovered", name=a.name, secs=s)

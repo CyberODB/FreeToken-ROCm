@@ -1096,6 +1096,13 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.fatal_error = message
         _GLOBAL_STATE.maintenance_state = "failed"
         logger.error("Backend supervisor: %s", message)
+        try:  # plain-language nudge under the raw error (ROCm fork 2026-11-08)
+            from freetoken.load_hints import explain
+
+            if (tip := explain(message)) is not None:
+                logger.error("WHY / WHAT TO TRY: %s", tip)
+        except Exception:
+            pass
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
