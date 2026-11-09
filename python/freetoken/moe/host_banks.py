@@ -112,7 +112,7 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_mapped")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
@@ -144,9 +144,34 @@ class HostBank:
             self._pinned = False
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
+        self._mapped = False
+
+    @classmethod
+    def mapped(cls, tensor: torch.Tensor) -> "HostBank":
+        """A bank that IS a read-only file view (``FREETOKEN_MAP_LOCKED_BANKS``): no RAM copy, no commit charge.
+
+        The OS pages it in from the file on first touch and may drop clean pages under pressure (they re-read
+        from disk). Never fill, pin, lock or release it: writes to a read-only view are an access violation.
+        It reports LOCKED, so the engine treats the layer exactly like a locked one (GPU slots + staged fetch)."""
+        assert tensor.device.type == "cpu" and tensor.is_contiguous(), (tensor.device, tensor.shape)
+        self = cls.__new__(cls)
+        self.tensor = tensor
+        self.addr = tensor.data_ptr()
+        self.nbytes = tensor.numel() * tensor.element_size()
+        self._buf = tensor  # keeps the view (and the file mapping under it) alive
+        self._pinned = False
+        self._locked = False
+        self._mapped = True
+        return self
+
+    @property
+    def is_mapped(self) -> bool:
+        return self._mapped
 
     @property
     def residency(self) -> HostResidency:
+        if self._mapped:
+            return HostResidency.LOCKED
         if self._pinned:
             return HostResidency.PINNED
         if self._locked:
@@ -162,6 +187,8 @@ class HostBank:
         ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
         if self._pinned:
             return
+        if self._mapped:
+            raise PinFailed("a file-mapped bank cannot be pinned")
         if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
             return
         from freetoken.kernel.pinned import host_register
@@ -188,7 +215,7 @@ class HostBank:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
-        if self._pinned:
+        if self._pinned or self._mapped:
             return
         if hasattr(mmap, "MADV_DONTNEED"):  # absent on Windows; pages are simply freed with the buffer
             self._buf.madvise(mmap.MADV_DONTNEED)
@@ -197,7 +224,7 @@ class HostBank:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but with no device address, so the GPU cannot gather its rows.
 
         Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
-        if self._locked or self._pinned:  # cudaHostRegister already page-locks
+        if self._locked or self._pinned or self._mapped:  # cudaHostRegister already page-locks; a mapped bank stays evictable
             return
         global _os_lock_failed
         if _os_lock_failed:
@@ -318,6 +345,15 @@ def backing_for(layer_id: int) -> str | None:
     if plan is None or not plan.has_unpinned or not _env_born_pinned() or not 0 <= layer_id < len(plan.labels):
         return None
     return "cuda" if plan.labels[layer_id] == HostResidency.PINNED.value else "mmap"
+
+
+def map_locked_banks(layer_id: int) -> bool:
+    """``FREETOKEN_MAP_LOCKED_BANKS=1`` and this layer is planned LOCKED: its byte-copy banks become read-only file views
+    (:meth:`HostBank.mapped`) instead of RAM copies. Added 2026-11-08 (ROCm fork, host-RAM plan)."""
+    if os.environ.get("FREETOKEN_MAP_LOCKED_BANKS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    plan = _requested_residency
+    return plan is not None and 0 <= layer_id < len(plan.labels) and plan.labels[layer_id] == HostResidency.LOCKED.value
 
 
 @contextlib.contextmanager

@@ -151,7 +151,7 @@ def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts:
 def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None):
     """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``."""
     from freetoken.moe.expert_banks import ExpertBanks
-    from freetoken.moe.host_banks import HostBank, PinPipeline, backing_for
+    from freetoken.moe.host_banks import HostBank, PinPipeline, backing_for, map_locked_banks
 
     index = gguf_tensor_index(model_path)
     scaled = has_expert_scales({name: info.ggml_type for name, info in index.items()})
@@ -162,6 +162,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
     sources: dict[str, list[torch.Tensor]] = {role: [] for role in roles}
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
+    mapped_bytes = 0
     reader = _ThreadedReader(_READ_THREADS) if _READ_THREADS > 0 and device is None and not dummy else None
     if reader is not None:
         logger.info_rank0(f"GGUF expert banks: threaded file reads ({_READ_THREADS} threads)")
@@ -203,7 +204,11 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             gu_dtype, down_dtype = (torch.bfloat16, torch.bfloat16) if pure_float else (rows[0].dtype, d.dtype)
             if device is None:
                 backing = backing_for(layer)
-                host = {"gate_up": HostBank(gate_up_shape, gu_dtype, backing=backing), "down": HostBank(tuple(d.shape), down_dtype, backing=backing)}
+                # a locked layer's down bank is a byte copy of ffn_down_exps: view the file instead (gate_up interleaves two tensors, so it stays a copy)
+                map_down = not dummy and backing != "cuda" and down_dtype == d.dtype and map_locked_banks(layer)
+                down_bank = HostBank.mapped(d) if map_down else HostBank(tuple(d.shape), down_dtype, backing=backing)
+                mapped_bytes += down_bank.nbytes if map_down else 0
+                host = {"gate_up": HostBank(gate_up_shape, gu_dtype, backing=backing), "down": down_bank}
                 if scaled:
                     host["global"] = HostBank((experts, 4), torch.float32, backing=backing)
                 banks = {role: bank.tensor for role, bank in host.items()}
@@ -249,14 +254,18 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                     else:
                         dst.copy_(r)
                     start += r.shape[1]
-                if reader is not None and banks["down"].dtype == d.dtype:
+                down_is_view = device is None and host["down"].is_mapped
+                if down_is_view:  # nothing to fill: the bank is the file
+                    if reader is not None:
+                        reader.wait()
+                elif reader is not None and banks["down"].dtype == d.dtype:
                     _read_rows(reader, down, banks["down"])
                     reader.wait()
                 else:
                     if reader is not None:
                         reader.wait()
                     banks["down"].copy_(d)
-                for info in (*parts, down):
+                for info in (*parts,) if down_is_view else (*parts, down):
                     _drop_page_cache(info)
             if device is None:
                 pins(layer, host)
@@ -264,6 +273,8 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 sources[role].append(bank)
     total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
     logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
+    if mapped_bytes:
+        logger.info_rank0(f"GGUF expert banks: {mapped_bytes / 2**30:.2f} GiB of that are read-only views of the file (FREETOKEN_MAP_LOCKED_BANKS, locked layers' down banks), not RAM copies")
     # the _bias formats are the gguf layouts plus the per-expert bias bank rows (_BANK_SCHEMAS)
     return ExpertBanks(("gguf_scaled" if scaled else "gguf") + ("_bias" if biased else ""), sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
 
