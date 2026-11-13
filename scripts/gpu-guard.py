@@ -302,7 +302,13 @@ def override_profile():
         if d.get("profile") not in PROFILES: return None
         if d.get("until") and time.time() > float(d["until"]): return None
         pid = d.get("pid")
-        if pid and ps("@(Get-Process -Id %d -ErrorAction SilentlyContinue).Count" % int(pid)) in ("", "0"): return None
+        if pid:  # 2026-11-11: the pid must be a python that started before the file was written; Windows reuses PIDs, and a
+            # stale file whose pid got reused flipped the daemon to "debug" (RAM floor 1.5) and killed it on 2026-11-09 15:09.
+            o = ps("$p = Get-Process -Id %d -ErrorAction SilentlyContinue; if ($p) { $p.ProcessName + '|' + "
+                   "[DateTimeOffset]::new($p.StartTime).ToUnixTimeSeconds() }" % int(pid))
+            nm, _, st = o.partition("|")
+            if "python" not in nm.lower() or not st.strip().isdigit(): return None
+            if float(st) > os.path.getmtime(os.path.join(DIR, "profile.override")) + 5: return None
         return d["profile"]
     except Exception:
         return None
