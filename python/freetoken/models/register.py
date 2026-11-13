@@ -111,6 +111,18 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
         unquantized_modules=("*.mlp.gate",),
     ),
+    # llama.cpp lfm2 / lfm2moe GGUF (Liquid AI LFM2): short-conv and GQA layers, GGUF only
+    "Lfm2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.lfm2", "Lfm2ForCausalLM",
+        parse_config="parse_gguf_config", iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Lfm2MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.lfm2", "Lfm2ForCausalLM",
+        parse_config="parse_gguf_config", iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        unquantized_modules=("*.mlp.gate",),
+    ),
     "LlamaForCausalLM": ModelSpec(
         "freetoken.models.llama",
         "LlamaForCausalLM",
