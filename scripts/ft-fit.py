@@ -14,6 +14,12 @@ Stages: 1 inventory/size check, 2 upgrades (MTP), 3 strategy, 4 memory ratio, 4s
       and "lossless"; kept only when lossless is true, the text is identical, the metric gains over 2% and nothing else
       in the run is over 5% worse. A tests string other than "decode" gets its own plain reference run.
   6p  parallel requests (2 and 4 at once, test cN): report only, never changes the winner; --no-parallel skips it.
+2026-11-13 flow rework (undo: ft-fit.py.bak-20261113-flow). The order is now:
+  3+4 strategy/ratio -> 5 spec (MTP, DFlash, then --token-map on the MTP winner) -> 6 slots on the config in use, against
+  --ctx-floor (fastest count that holds it) -> 7 final: the launch line as stamped, in one run, with the class's tune flags
+  -> 8 context fill on that run -> 8-kv8 one 8-bit KV row (report only; --no-kv8).
+  Flags and the parallel report moved to --tune: once per model class, saved to speedprobe/tune/<class>.json, flag winners
+  run twice. A normal fit reads that file and only checks the kept flags in its final run.
 Pass/fail comes from the probe's results.jsonl row (its exit code is 0 on a failed load), kills from the
 guard journal. Results go to speedprobe/fit/<model>.jsonl; a rerun reuses rows with the same name and args.
 Stdlib only, never imports torch.
@@ -49,6 +55,12 @@ SLOTS = (4000, 3000, 2000)
 SLOT_DECODE, SLOT_PREFILL = 0.05, 0.10
 FLAG_WORSE = 0.05  # 2026-11-12 stage 6: a flag is not kept when another number of its run drops more than this
 PARALLEL = (2, 4)  # 2026-11-12 stage 6p: requests at once
+# 2026-11-13 flow rework (undo: ft-fit.py.bak-20261113-flow)
+SLOTS_UP = (6500, 8000)  # tried only when 5000 slots already hold the context floor: more experts on the GPU for speed
+TUNE_DIR = os.path.join(PROBE_OUT, "tune")  # <class>.json: the flags and parallel report of a --tune run
+MAP_DIR = os.path.join(PROBE_OUT, "token-maps")
+ENGINE_PY = os.environ.get("FT_FIT_PYTHON", r"E:\freetoken-rocm\.venv\Scripts\python.exe")  # make_token_map.py needs numpy
+KV8 = "fp8_per_token_head"
 
 
 # ---------- stage 1-2: no GPU ----------
@@ -385,14 +397,15 @@ def ladder(inv: dict, a) -> dict:
         notes.append("no config loaded; see the errors above")
         return {"inv": inv, "ctx_used": R.ctx, "best": None, "spec": None, "flags": [], "confirm": None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
     plain = best
-    slots = None
-    if inv.get("experts") and "hybrid" in best["args"] and not a.no_slots:
-        if getattr(a, "slots_mode", "sweep") == "auto":  # 2026-11-12: one --moe-cache-auto run instead of the sweep
-            slots = slot_auto_stage(R, inv, best, notes, int(getattr(a, "kv_reserve", 0) or a.ctx or 65536))
-        else:
-            slots = slot_stage(R, inv, best, notes)
-        if slots.get("row"):
-            plain = slots.pop("row")
+    floor = int(getattr(a, "ctx_floor", 0) or a.ctx or 65536)
+    if getattr(a, "tune", False):
+        # --tune (2026-11-13): the machine-level settings, once per model class. Flags (each winner run twice) and the parallel
+        # report on the plain ratio winner; saved to speedprobe/tune/<class>.json, which every later fit of the class reads.
+        flags_out = flag_stage(R, inv, plain)
+        par = None if getattr(a, "no_parallel", False) else parallel_stage(R, plain, notes)
+        notes.append(f"tune run: flags and parallel report saved to {save_tune(inv, plain, flags_out, par)}; not a config to stamp")
+        return {"inv": inv, "ctx_used": R.ctx, "best": plain, "spec": None, "use": plain, "flags": flags_out, "confirm": None, "parallel": par,
+                "tune": True, "reserve": a.reserve_gib or None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
     # stage 5: spec decoding. MTP first; 2026-11-12: then a DFlash draft when --dflash-head names one. The faster is `spec`.
     spec = None
 
@@ -415,6 +428,15 @@ def ladder(inv: dict, a) -> dict:
         notes.append("no MTP draft head on disk; " + ("MTP skipped" if getattr(a, "dflash_head", None) else "spec decoding skipped"))
     else:
         spec = spec_try("mtp", draft)
+        tm = token_map(inv["model"], getattr(a, "token_map", "off"), notes) if spec is not None else None
+        if tm:  # 2026-11-13 (upstream #892): the draft scores only the ids in the map; the target still verifies the whole vocabulary
+            R.max_runs += 1
+            r = R.run("5-spec", f"{spec['label']}-tmap", spec["args"] + ["--speculative-token-map", tm])
+            if r is not None:
+                gain = r["ok"] and better(r, spec)
+                notes.append(f"token map ({os.path.basename(tm)}): " + (f"{tps(r)} vs {tps(spec)} tok/s, {'kept' if gain else 'not kept'}" if r["ok"] else f"failed: {err(r)}"))
+                if gain:
+                    spec = r
     dhead = getattr(a, "dflash_head", None)
     if dhead and not os.path.exists(dhead):
         notes.append(f"--dflash-head {dhead} does not exist; DFlash skipped")
@@ -425,29 +447,141 @@ def ladder(inv: dict, a) -> dict:
             notes.append(f"spec decoding: MTP {tps(spec)} tok/s, DFlash {tps(dfl)} tok/s; {'DFlash' if better(dfl, spec) else 'MTP'} kept")
         if dfl is not None and (spec is None or better(dfl, spec)):
             spec = dfl
-    # stage 6: flags, on the plain config (lossless = byte-identical decode text)
-    flags_out = flag_stage(R, inv, plain)
-    # stage 6p (2026-11-12): parallel requests on the plain config; a report only, the winner's args stay as they are
-    par = None if getattr(a, "no_parallel", False) else parallel_stage(R, plain, notes)
-    # stage 7: fit confirmation (vision if present, 5k prompt)
+    # 2026-11-13: `use` is the config the card will carry. Slots are traded on it (after spec, which takes VRAM), not on plain.
+    use = spec if spec and better(spec, plain) else plain
+    slots = None
+    if inv.get("experts") and "hybrid" in use["args"] and not a.no_slots:
+        if getattr(a, "slots_mode", "sweep") == "auto":  # 2026-11-12: one --moe-cache-auto run instead of the sweep
+            slots = slot_auto_stage(R, inv, use, notes, int(getattr(a, "kv_reserve", 0) or floor))
+        else:
+            slots = slot_stage(R, inv, use, notes, floor)
+        if slots.get("row"):
+            use = slots.pop("row")
+    # flags and the parallel report come from the class's tune file (2026-11-13); a fit no longer runs them itself
+    tune = load_tune(inv)
+    flags_out = [dict(f) for f in (tune or {}).get("flags", []) if f.get("keep")]
+    par = (tune or {}).get("parallel")
+    if tune:
+        notes.append(f"flags from the tune run of {tune.get('when')} on {os.path.basename(str(tune.get('model')))} (class {tune.get('class')}): "
+                     + (", ".join(f"`{f['value']}`" if f["kind"] == "arg" else f"{f['name']}={f['value']}" for f in flags_out) or "none kept"))
+    else:
+        notes.append(f"no tune result for class {model_class(inv)}: no flags applied. Run once with --tune (BENCH_FT_FIT_TUNE=1).")
+    # stage 7: the config as stamped, in one run: winner + kept flags, vision if present, a 5K prompt, at the model's own
+    # maximum context (so its KV is the real room). Its numbers are the card's.
     vis = bool(inv["mmproj"])
-    confirm = None
-    args = list(plain["args"])
-    for attempt in range(2):
-        confirm = R.run("7-confirm", f"{plain['label']}-confirm{attempt}{'-vis' if vis else ''}", args, tests="decode,p5k", vision=vis)
-        if confirm is None or confirm["ok"]:
-            break
-        notes.append(f"confirm {'with vision ' if vis else ''}at {' '.join(args)} failed: {err(confirm)}")
-        m = [i for i, x in enumerate(args) if x == "--memory-ratio"]
-        if not m:
-            break
-        args[m[0] + 1] = f"{float(args[m[0] + 1]) - 0.05:.2f}"
+    cap = min(inv.get("context_length") or 262144, 524288) // 1024 * 1024
+    R.max_runs += 3
+
+    def final(args: list[str], env: dict, tag: str, vision: bool) -> tuple[dict | None, list[str], int]:
+        r, c = None, cap
+        for attempt in range(3):
+            r = R.run("7-final", f"{use['label']}-final{tag}{attempt}{'-vis' if vision else ''}", args, tests="decode,p5k", vision=vision, env=env or None,
+                      base_args="fused" not in args, ctx=c)
+            if r is None or r["ok"]:
+                break
+            notes.append(f"as-stamped run {'with vision ' if vision else ''}at {' '.join(args)} (context {c}) failed: {err(r)}")
+            m = [i for i, x in enumerate(args) if x == "--memory-ratio"]
+            if r.get("kv_short"):
+                c = c * 3 // 4 // 1024 * 1024  # the KV does not fit at this cap: a smaller one
+            elif m:
+                args = list(args)
+                args[m[0] + 1] = f"{float(args[m[0] + 1]) - 0.05:.2f}"
+            else:
+                break
+        return r, args, c
+
+    keep_env = {f["name"]: f["value"] for f in flags_out if f["kind"] == "env"}
+    keep_args = [x for f in flags_out if f["kind"] == "arg" for x in f["value"].split()]
+    confirm, fargs, fcap = final(use["args"] + keep_args, keep_env, "", vis)
     if vis and confirm is not None and not confirm["ok"]:
-        confirm = R.run("7-confirm", f"{plain['label']}-confirm-novis", plain["args"], tests="decode,p5k")
+        confirm, fargs, fcap = final(use["args"] + keep_args, keep_env, "-novis", False)
         notes.append("vision does not fit with this config: launch with --mm-disable vision")
-    ctxmax = ctx_stage(R, inv, spec if spec and better(spec, plain) else plain, vis and bool(confirm and confirm.get("ok")), notes)
-    return {"inv": inv, "ctx_used": R.ctx, "best": plain, "spec": spec, "flags": flags_out, "confirm": confirm, "ctxmax": ctxmax, "slots": slots,
-            "parallel": par, "reserve": a.reserve_gib or None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
+    if flags_out and confirm is not None and (not confirm["ok"] or tps(confirm) < tps(use) * (1 - FLAG_WORSE)):
+        # the tune flags hurt this model (or broke the load): one run without them, and the better of the two is stamped
+        R.max_runs += 1
+        bare, bargs, bcap = final(list(use["args"]), {}, "-noflags", bool(confirm.get("vision")) if confirm["ok"] else vis)
+        if bare is not None and bare["ok"] and (not confirm["ok"] or better(bare, confirm)):
+            notes.append(f"tune flags dropped: {tps(bare)} tok/s without them, {tps(confirm) if confirm['ok'] else 'a failed load'} with them")
+            confirm, fargs, fcap, flags_out, keep_env = bare, bargs, bcap, [], {}
+    if fargs[:len(use["args"])] != use["args"]:  # the as-stamped run had to lower the memory ratio
+        use = dict(use, args=fargs[:len(use["args"])])
+    vis_ok = vis and bool(confirm and confirm.get("ok") and confirm.get("vision"))
+    stamped = dict(use, args=fargs)
+    # stage 8: context on the as-stamped config (its load is the run above), then the 8-bit KV row
+    ctxmax = ctx_stage(R, inv, stamped, vis_ok, notes, first=confirm if confirm and confirm.get("ok") else None, env=keep_env or None, cap=fcap)
+    if ctxmax.get("ctx") and ctxmax["ctx"] < floor:
+        notes.append(f"context {ctxmax['ctx']} is under the floor of {floor} tokens: this config does not meet the goal")
+    kv8 = None
+    if confirm and confirm.get("ok") and not getattr(a, "no_kv8", False):
+        kv8 = kv8_row(R, stamped, vis_ok, keep_env or None, fcap, confirm, ctxmax)
+    return {"inv": inv, "ctx_used": R.ctx, "best": plain, "spec": spec, "use": use, "flags": flags_out, "confirm": confirm, "ctxmax": ctxmax,
+            "slots": slots, "parallel": par, "floor": floor, "kv8": kv8, "tune_from": {k: tune.get(k) for k in ("when", "model", "class")} if tune else None,
+            "reserve": a.reserve_gib or None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
+
+
+def model_class(inv: dict) -> str:
+    """The class a tune result is shared by: architecture, and expert model or dense."""
+    return re.sub(r"[^a-z0-9]+", "-", f"{inv.get('arch')}-{'moe' if inv.get('experts') else 'dense'}".lower())
+
+
+def save_tune(inv: dict, plain: dict, flags: list[dict], par: dict | None) -> str:
+    os.makedirs(TUNE_DIR, exist_ok=True)
+    p = os.path.join(TUNE_DIR, model_class(inv) + ".json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"class": model_class(inv), "model": inv["model"], "when": time.strftime("%Y-%m-%d %H:%M"), "plain_args": plain["args"],
+                   "plain_tps": tps(plain), "flags": flags, "parallel": par}, f, indent=1)
+    return p
+
+
+def load_tune(inv: dict) -> dict | None:
+    try:
+        with open(os.path.join(TUNE_DIR, model_class(inv) + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def token_map(model: str, how: str, notes: list[str]) -> str | None:
+    """A --speculative-token-map file for this model: `how` is off, a file, or auto (speedprobe/token-maps/<model>.bin, written
+    once by upstream's scripts/make_token_map.py with the engine's Python; it reads only the tokenizer, no GPU)."""
+    if not how or how == "off":
+        return None
+    if how != "auto":
+        if os.path.isfile(how):
+            return how
+        notes.append(f"token map {how} does not exist; skipped")
+        return None
+    p = os.path.join(MAP_DIR, slug(model) + ".bin")
+    if os.path.isfile(p):
+        return p
+    if not os.path.isfile(ENGINE_PY):
+        notes.append(f"token map skipped: the engine's Python is not at {ENGINE_PY} (set FT_FIT_PYTHON)")
+        return None
+    os.makedirs(MAP_DIR, exist_ok=True)
+    try:
+        q = subprocess.run([ENGINE_PY, "scripts/make_token_map.py", model, "-o", p], cwd=REPO, env=dict(os.environ, PYTHONPATH=os.path.join(REPO, "python")),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+        tail = q.stdout.decode("utf-8", "replace").strip().splitlines()[-1:]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        q, tail = None, [str(e)]
+    if q is None or q.returncode or not os.path.isfile(p):
+        notes.append(f"token map could not be written: {(tail or ['no output'])[0][:200]}")
+        return None
+    return p
+
+
+def kv8_row(R: "Runner", win: dict, vis: bool, env: dict | None, cap: int, confirm: dict, ctxmax: dict) -> dict:
+    """2026-11-13 (upstream #894): the as-stamped config once more with the KV stored in 8 bits. A report only: it is lossy, so
+    it never goes in the launch line; the card shows how much more context it would hold and what it does to speed and text."""
+    R.max_runs += 1
+    out = {"format": KV8, "ok": False, "base_kv_tokens": ctxmax.get("kv_tokens") or confirm.get("kv_tokens")}
+    r = R.run("8-kv8", f"{win['label']}-kv8", win["args"] + ["--kv-cache-dtype", KV8], tests="decode", vision=vis, env=env,
+              base_args="fused" not in win["args"], ctx=cap)
+    if r is not None:
+        out.update(ok=bool(r["ok"]), kv_tokens=r.get("kv_tokens"), decode=tps(r) if r["ok"] else None, base_decode=tps(confirm),
+                   text_same=bool(r["ok"] and r.get("text") == confirm.get("text")), max_vram_gib=r.get("max_vram_gib"),
+                   error=None if r["ok"] else str(r.get("error"))[:300])
+    return out
 
 
 def flag_tests(fl: dict) -> str:
@@ -495,23 +629,38 @@ def flag_stage(R: "Runner", inv: dict, plain: dict) -> list[dict]:
             out.append({**fl, "result": f"not run (the plain reference with tests {tests} failed: {err(ref)[:200]})"})
             continue
         ref_m, fid, rows, said = flag_metric(ref, metric), re.sub(r"[^a-z0-9]+", "", fl["id"].lower()), [], []
-        for v in values(fl):
-            label = f"{plain['label']}-{fid}" + ("-" + re.sub(r"[^a-z0-9.]+", "", (v.split() or ["x"])[-1].lower()) if fl.get("values") else "")
+
+        def one(label: str, v: str) -> dict | None:
             r = R.run("6-flag", label, plain["args"] + ([] if fl["kind"] == "env" else v.split()), tests=tests,
                       env={fl["name"]: v} if fl["kind"] == "env" else None)
             if r is None:
-                spent = True
-                break
+                return None
             ok = bool(r.get("ok"))
             same, m = ok and r.get("text") == plain.get("text"), flag_metric(r, metric)
             checks = [("decode", tps(r), tps(ref)), ("5K prefill", (r.get("prefill") or {}).get("p5k"), (ref.get("prefill") or {}).get("p5k"))]
             worse = [f"{n} {new} vs {old}" for n, new, old in checks if ok and new and old and new < old * (1 - FLAG_WORSE)]
-            rows.append({"label": label, "value": v, "ok": ok, "metric": m if ok else None, "ref": ref_m, "text_same": same, "worse": worse,
-                         "pass": bool(fl.get("lossless") is True and same and ref_m and m > ref_m * (1 + SAME) and not worse)})
             said.append((f"`{v}`: " if fl.get("values") else "") + fmt(r) + ("" if metric == "decode" or not ok else f"; {metric} {m} vs {ref_m}")
                         + ("; text identical" if same else ("; TEXT DIFFERS" if ok else "")) + (f"; worse: {', '.join(worse)}" if worse else ""))
+            return {"label": label, "value": v, "ok": ok, "metric": m if ok else None, "ref": ref_m, "text_same": same, "worse": worse,
+                    "pass": bool(fl.get("lossless") is True and same and ref_m and m > ref_m * (1 + SAME) and not worse)}
+
+        for v in values(fl):
+            row = one(f"{plain['label']}-{fid}" + ("-" + re.sub(r"[^a-z0-9.]+", "", (v.split() or ["x"])[-1].lower()) if fl.get("values") else ""), v)
+            if row is None:
+                spent = True
+                break
+            rows.append(row)
         if rows:
             top = max(rows, key=lambda x: (x["pass"], x["ok"], x["metric"] or 0))
+            if top["pass"]:  # 2026-11-13: one 512-token run is +-2%, so a winner has to win twice
+                R.max_runs += 1
+                said.append("second run")
+                again = one(top["label"] + "-again", top["value"])
+                if again is None or not again["pass"]:
+                    top["pass"] = False
+                    said.append("gain not repeated" if again else "second run skipped (run budget): not kept")
+                else:
+                    top["metric"] = round((top["metric"] + again["metric"]) / 2, 2)
             why = "" if fl.get("lossless") is True else f"; lossless {fl.get('lossless')}: reported only"
             out.append({**fl, "value": top["value"], "result": " | ".join(said) + why, "keep": top["pass"], "metric_value": top["metric"],
                         "ref_value": ref_m, "variants": rows})
@@ -571,7 +720,7 @@ def slot_auto_stage(R: "Runner", inv: dict, win: dict, notes: list[str], reserve
     cap = min(inv.get("context_length") or 262144, 524288) // 1024 * 1024
     out = {"mode": "auto", "ref": 5000, "pick": 5000, "rows": [], "cap": cap, "kv_reserve": reserve}
     R.max_runs += 1
-    r = R.run("4s-slots", f"{win['label']}-sauto", ["--moe-cpu-layers", "auto"] + win["args"] + ["--moe-cache-auto", "--kv-reserve-tokens", str(reserve)],
+    r = R.run("6-slots", f"{win['label']}-sauto", ["--moe-cpu-layers", "auto"] + win["args"] + ["--moe-cache-auto", "--kv-reserve-tokens", str(reserve)],
               tests="decode,p5k", base_args=False, ctx=cap)
     if r is None:
         notes.append("auto slots skipped: run budget spent")
@@ -588,17 +737,22 @@ def slot_auto_stage(R: "Runner", inv: dict, win: dict, notes: list[str], reserve
     return out
 
 
-def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str]) -> dict:
-    """Stage 4s (2026-11-11): the expert GPU slots against the KV (context) on the ratio winner. Fewer slots leave VRAM for
-    KV, so the fit keeps the lowest slot count whose decode and 5K prefill stay within SLOT_DECODE / SLOT_PREFILL of the
-    5000-slot run. Runs load at the model's own maximum context, so "Allocating N tokens for KV cache" is the real room and
-    not the ladder's cap. Returns the table, the pick, and (when the pick is not 5000) its row, which becomes the plain winner."""
+def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str], floor: int = 0) -> dict:
+    """Stage 6 (was 4s; 2026-11-13: after spec, against a context floor): the expert GPU slots against the KV on the config the
+    card will carry. Runs load at the model's own maximum context, so "Allocating N tokens for KV cache" is the real room.
+    The goal is the fastest config that holds `floor` tokens:
+      5000 slots hold the floor -> try SLOTS_UP while the floor still holds and decode gains over SAME;
+      they do not               -> step down SLOTS until the KV reaches the floor (speed is not weighed: the floor is the goal);
+                                   if no count reaches it, the count with the most KV is kept and a note says so.
+    floor 0 is the 2026-11-11 rule: the lowest count within SLOT_DECODE / SLOT_PREFILL of 5000 while the KV grows.
+    Returns the table, the pick, and (when the pick is not 5000) its row, which becomes the winner."""
     cap = min(inv.get("context_length") or 262144, 524288) // 1024 * 1024
-    out = {"ref": 5000, "pick": 5000, "rows": [], "cap": cap}
+    floor = min(floor, cap)
+    out = {"ref": 5000, "pick": 5000, "rows": [], "cap": cap, "floor": floor or None}
     R.max_runs += len(SLOTS) + 1
 
     def one(n: int) -> dict | None:
-        r = R.run("4s-slots", f"{win['label']}-s{n}", win["args"] + (["--moe-cache-size", str(n)] if n != 5000 else []), tests="decode,p5k", ctx=cap)
+        r = R.run("6-slots", f"{win['label']}-s{n}", win["args"] + (["--moe-cache-size", str(n)] if n != 5000 else []), tests="decode,p5k", ctx=cap)
         if r is not None:
             out["rows"].append({"slots": n, "ok": r["ok"], "decode": tps(r), "prefill": (r.get("prefill") or {}).get("p5k"),
                                 "kv_tokens": r.get("kv_tokens"), "max_vram_gib": r.get("max_vram_gib"), "error": None if r["ok"] else str(r.get("error"))[:200]})
@@ -609,6 +763,44 @@ def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str]) -> dict:
         notes.append("slot sweep skipped: " + ("run budget spent" if ref is None else f"the 5000-slot run at context {cap} failed: {err(ref)}"))
         return out
     pick, kv = ref, ref.get("kv_tokens") or 0
+    if floor:
+        if kv >= floor:
+            for n in SLOTS_UP:
+                r = one(n)
+                if r is None:
+                    break
+                if not r["ok"]:
+                    notes.append(f"slot sweep: {n} slots failed: {err(r)}; kept {out['pick']}")
+                    break
+                if (r.get("kv_tokens") or 0) < floor:
+                    notes.append(f"slot sweep: {n} slots leave {r.get('kv_tokens')} KV tokens, under the floor of {floor}; kept {out['pick']}")
+                    break
+                if not better(r, pick):
+                    notes.append(f"slot sweep: {n} slots is no faster ({tps(r)} vs {tps(pick)} tok/s); kept {out['pick']}")
+                    break
+                pick, kv, out["pick"] = r, r["kv_tokens"], n
+        else:
+            for n in SLOTS:
+                r = one(n)
+                if r is None:
+                    break
+                if not r["ok"]:
+                    notes.append(f"slot sweep: {n} slots failed: {err(r)}")
+                    break
+                if (r.get("kv_tokens") or 0) <= kv:
+                    notes.append(f"slot sweep: {n} slots gave no more context ({r.get('kv_tokens')} KV tokens vs {kv}); kept {out['pick']}")
+                    break
+                pick, kv, out["pick"] = r, r["kv_tokens"], n
+                if kv >= floor:
+                    break
+            if kv < floor:
+                notes.append(f"slot sweep: no slot count holds the floor of {floor} tokens; kept {out['pick']} slots ({kv} KV tokens), the most context found")
+            elif pick is not ref:
+                notes.append(f"slot sweep: {out['pick']} slots hold the floor ({kv} KV tokens) at {tps(pick)} tok/s; 5000 slots held {ref.get('kv_tokens')} at {tps(ref)}")
+        out["kv_tokens"] = kv
+        if pick is not ref:
+            out["row"] = pick
+        return out
     if kv >= cap:
         notes.append(f"slot sweep: 5000 slots already hold the model's whole context ({cap}); nothing to trade")
         return out
@@ -636,17 +828,20 @@ def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str]) -> dict:
     return out
 
 
-def ctx_stage(R: "Runner", inv: dict, win: dict, vis: bool, notes: list[str]) -> dict:
+def ctx_stage(R: "Runner", inv: dict, win: dict, vis: bool, notes: list[str], first: dict | None = None, env: dict | None = None,
+              cap: int | None = None) -> dict:
     """Stage 8: how much context fits on top of the winner. The engine sizes its KV at load from what VRAM is left
     (--max-seq-len-override is only a cap), so: load at the model's own maximum, read the KV tokens it allocated, send a prompt
-    that fills it, and step down on a failure ("prompt is too long: N > M maximum", or a KV shortfall at load)."""
-    cap = min(inv.get("context_length") or 262144, 524288) // 1024 * 1024
+    that fills it, and step down on a failure ("prompt is too long: N > M maximum", or a KV shortfall at load).
+    2026-11-13: `first` is a good run of these args at `cap` (the as-stamped run), which stands in for the load here."""
+    cap = cap or min(inv.get("context_length") or 262144, 524288) // 1024 * 1024
+    ba = "fused" not in win["args"]
     out = {"cap": cap, "kv_tokens": None, "ctx": None, "ok": False, "tps": None, "fill_k": None}
     R.max_runs += 4  # a few extra runs: this stage is the point of a card's context
     try:
-        n = None
-        for _ in range(3):  # load at the cap; a shortfall at load steps the cap down
-            r = R.run("8-ctx", f"{win['label']}-ctx{cap // 1024}k", win["args"], tests="decode", vision=vis, ctx=cap)
+        n = (first.get("kv_tokens") or cap) if first and first.get("ok") else None
+        for _ in range(0 if n else 3):  # load at the cap; a shortfall at load steps the cap down
+            r = R.run("8-ctx", f"{win['label']}-ctx{cap // 1024}k", win["args"], tests="decode", vision=vis, env=env, base_args=ba, ctx=cap)
             if r is None:
                 notes.append("context stage skipped: run budget spent")
                 return out
@@ -663,7 +858,7 @@ def ctx_stage(R: "Runner", inv: dict, win: dict, vis: bool, notes: list[str]) ->
         fill = top
         for _ in range(3):
             k = max(1, (fill - 1500) // 1000)
-            r = R.run("8-ctx", f"{win['label']}-fill{k}k", win["args"], tests=f"decode,p{k}k", vision=vis, ctx=cap)
+            r = R.run("8-ctx", f"{win['label']}-fill{k}k", win["args"], tests=f"decode,p{k}k", vision=vis, env=env, base_args=ba, ctx=cap)
             if r is None:
                 notes.append("context fill test skipped: run budget spent")
                 break
@@ -699,8 +894,13 @@ def card(res: dict) -> str:
          + (f"every run at context {res['ctx']} (--max-seq-len-override)." if res.get("ctx") else "engine default context (no --ctx)."), ""]
     if best is None:
         L += ["**No config loaded.**", ""]
+    elif res.get("tune"):
+        L[0] = f"# Tune result: class {model_class(inv)} (run on {name})"
+        L += [f"**Not a config to stamp.** Flags and the parallel report for every model of this class, measured on the plain config "
+              f"`{' '.join(best['args'])}` ({tps(best)} tok/s). A fit of such a model applies the kept flags in its as-stamped run.", ""]
     else:
-        win = spec if spec and better(spec, best) else best
+        win = res.get("use") or (spec if spec and better(spec, best) else best)
+        is_spec = any(x in SPEC for x in win["args"])
         keep_env = {f["name"]: f["value"] for f in res["flags"] if f.get("keep") and f["kind"] == "env"}
         keep_args = [x for f in res["flags"] if f.get("keep") and f["kind"] == "arg" for x in f["value"].split()]
         vis_ok = confirm is not None and confirm.get("ok") and confirm.get("vision")
@@ -711,8 +911,15 @@ def card(res: dict) -> str:
             L += [f"Fitted with FREETOKEN_DESKTOP_RESERVE_GB={res['reserve']} on every run (VRAM held back for the desktop); serve with the same value.", ""]
         if keep_env:
             L += [f"Env: {' '.join(f'{k}={v}' for k, v in keep_env.items())}", ""]
-        L += [f"- Decode: **{tps(win)} tok/s** ({('DFlash' if 'dflash' in win['args'] else 'MTP') + ', not byte-identical to plain decode' if win is spec else 'plain decode'}); plain best {tps(best)} tok/s",
-              f"- Fit check (decode + 5k prompt{', vision on' if vis_ok else ''}): " + (fmt(confirm) if confirm else "not run"), ""]
+        done = bool(confirm and confirm.get("ok"))
+        L += [f"- Decode: **{tps(confirm) if done else tps(win)} tok/s** " + ("as stamped (this exact line in one run)" if done else "(ladder run; the as-stamped run did not pass)")
+              + f"; ladder run of the same config {tps(win)} tok/s ({('DFlash' if 'dflash' in win['args'] else 'MTP') + ', not byte-identical to plain decode' if is_spec else 'plain decode'}); plain best {tps(best)} tok/s",
+              f"- As-stamped run (decode + 5k prompt{', vision on' if vis_ok else ''}): " + (fmt(confirm) if confirm else "not run")]
+        cm0 = res.get("ctxmax") or {}
+        if res.get("floor"):
+            L += [f"- Context floor {res['floor']} tokens: " + ("**met**" if (cm0.get("ctx") or 0) >= min(res["floor"], cm0.get("cap") or res["floor"]) else "**NOT met**")
+                  + f" ({cm0.get('ctx')} tokens fit)"]
+        L += [""]
     L += ["## Model", "", f"- {inv['arch']}, {inv['layers']} layers, {inv['experts']} experts ({inv['experts_used']} used), file {inv['file_gib']} GiB "
           f"(experts {inv['experts_gib']}, dense {inv['dense_gib']})", f"- Expert tensors: {inv['expert_types']}"
           + (f"; gate!=up layers {inv['gate_up_q8_layers']} load as Q8_0" if inv["gate_up_q8_layers"] else ""),
@@ -728,6 +935,15 @@ def card(res: dict) -> str:
         L += ["", "## Context", "", f"- {'Confirmed' if cm['ok'] else 'Unconfirmed'} context on top of the winner: **{cm['ctx']} tokens** "
               f"(engine KV {cm['kv_tokens']} tokens; model max {cm['cap']}); fill test {cm.get('fill_k')}K prompt"
               + (f", {cm['tps']} tok/s decode at that depth" if cm.get("tps") else "")]
+    k8 = res.get("kv8")
+    if k8:  # 2026-11-13: a report only
+        L += ["", "## 8-bit KV (lossy, not in the launch line)", ""]
+        if k8.get("ok"):
+            L += [f"- `--kv-cache-dtype {k8['format']}` on the as-stamped config: KV **{k8.get('kv_tokens')} tokens** (16-bit: {k8.get('base_kv_tokens')}), "
+                  f"decode {k8.get('decode')} tok/s (16-bit: {k8.get('base_decode')}), text {'identical' if k8.get('text_same') else 'DIFFERS'} on the decode test.",
+                  "- It changes what the model sees of its own context, so adding it is your call; the decode test is too short to judge quality."]
+        else:
+            L += [f"- `--kv-cache-dtype {k8['format']}` did not run: {k8.get('error') or 'skipped (run budget)'}"]
     sl = res.get("slots")
     if sl and sl.get("rows") and sl.get("mode") == "auto":  # 2026-11-12
         L += ["", "## Expert slots against context", "", f"--slots-mode auto: the engine sized the slots itself (--moe-cache-auto, KV floor {sl['kv_reserve']} tokens): "
@@ -735,9 +951,13 @@ def card(res: dict) -> str:
               + f". Loaded at context {sl['cap']}.", "", "| slots | decode tok/s | 5K prefill tok/s | KV tokens | max VRAM GiB |", "|---|---|---|---|---|"]
         L += [f"| {x['slots'] or 'auto'} | {x['decode'] if x['ok'] else 'FAIL'} | {x['prefill'] or ''} | {x['kv_tokens'] or ''} | {x['max_vram_gib'] or ''} |" for x in sl["rows"]]
     elif sl and sl.get("rows"):
-        L += ["", "## Expert slots against context", "", f"Picked **{sl['pick']} slots** (lowest count within {int(SLOT_DECODE * 100)}% decode and {int(SLOT_PREFILL * 100)}% 5K prefill of 5000, "
-              f"while the KV still grew). Loaded at context {sl['cap']}.", "", "| slots | decode tok/s | 5K prefill tok/s | KV tokens | max VRAM GiB |", "|---|---|---|---|---|"]
+        rule = (f"the fastest count that holds the floor of {sl['floor']} KV tokens" if sl.get("floor") else
+                f"lowest count within {int(SLOT_DECODE * 100)}% decode and {int(SLOT_PREFILL * 100)}% 5K prefill of 5000, while the KV still grew")
+        L += ["", "## Expert slots against context", "", f"Picked **{sl['pick']} slots** ({rule}). Loaded at context {sl['cap']}.", "", "| slots | decode tok/s | 5K prefill tok/s | KV tokens | max VRAM GiB |", "|---|---|---|---|---|"]
         L += [f"| {x['slots']} | {x['decode'] if x['ok'] else 'FAIL'} | {x['prefill'] or ''} | {x['kv_tokens'] or ''} | {x['max_vram_gib'] or ''} |" for x in sl["rows"]]
+    tf = res.get("tune_from")
+    if tf:
+        L += ["", f"Flags below come from the tune run of {tf.get('when')} on {os.path.basename(str(tf.get('model')))} (class {tf.get('class')}); this fit only ran them in the as-stamped run."]
     if res["flags"]:
         L += ["", "## Flags", ""] + [f"- `{f['id']}` ({f['status']}, lossless {f.get('lossless')}): {f['result']}{' **kept**' if f.get('keep') else ''}" for f in res["flags"]]
     par = res.get("parallel")
@@ -765,7 +985,13 @@ def winner(res: dict) -> dict:
            "notes": res["notes"], "ok": best is not None}
     if best is None:
         return out
-    win = spec if spec and better(spec, best) else best
+    if res.get("tune"):  # 2026-11-13: a tune run has no config to stamp; OpenFT and the bench skip the card for it
+        out.update(tune=True, tune_class=model_class(inv), plain_tps=tps(best), parallel=res.get("parallel"),
+                   flags=[{k: f.get(k) for k in ("id", "kind", "name", "value", "keep", "result")} for f in res["flags"]])
+        return out
+    win = res.get("use") or (spec if spec and better(spec, best) else best)
+    is_spec = any(x in SPEC for x in win["args"])
+    done = bool(confirm and confirm.get("ok"))
     keep_env = {f["name"]: f["value"] for f in res["flags"] if f.get("keep") and f["kind"] == "env"}
     keep_args = [x for f in res["flags"] if f.get("keep") and f["kind"] == "arg" for x in f["value"].split()]
     vis_ok = bool(confirm and confirm.get("ok") and confirm.get("vision"))
@@ -796,12 +1022,18 @@ def winner(res: dict) -> dict:
     args += keep_args + ([] if vis_ok or not inv["mmproj"] else ["--mm-disable", "vision"])
     ram = [r["min_ram_gib"] for r in (win, confirm) if r and r.get("min_ram_gib") is not None]
     vram = [r["max_vram_gib"] for r in (win, confirm) if r and r.get("max_vram_gib") is not None]
-    out.update(args=" ".join(args), cache=cache, head=head, env=keep_env, pick="spec" if win is spec else "plain",
-               tps=tps(win), plain_tps=tps(best), spec_tps=tps(spec) if spec else None,
-               p5k_tps=confirm.get("tps", {}).get("p5k") if confirm and confirm.get("ok") else None,
-               confirm_ok=bool(confirm and confirm.get("ok")), vision=bool(inv["mmproj"]), vision_ok=vis_ok,
-               min_ram_gib=min(ram) if ram else None, max_vram_gib=max(vram) if vram else None, load_s=win.get("load_s"),
-               text_same=bool(win is best or spec.get("text") == best.get("text")))
+    # tps is the as-stamped run's (the whole launch line in one process); ladder_tps is the same config's earlier ladder run
+    out.update(args=" ".join(args), cache=cache, head=head, env=keep_env, pick="spec" if is_spec else "plain",
+               tps=tps(confirm) if done else tps(win), final_tps=tps(confirm) if done else None, ladder_tps=tps(win),
+               plain_tps=tps(best), spec_tps=tps(spec) if spec else None,
+               p5k_tps=confirm.get("tps", {}).get("p5k") if done else None,
+               confirm_ok=done, vision=bool(inv["mmproj"]), vision_ok=vis_ok,
+               min_ram_gib=min(ram) if ram else None, max_vram_gib=max(vram) if vram else None, load_s=(confirm if done else win).get("load_s"),
+               text_same=bool(not is_spec or win.get("text") == best.get("text")),
+               flags=[f["id"] for f in res["flags"] if f.get("keep")], tune_from=res.get("tune_from"), kv8=res.get("kv8"))
+    if res.get("floor"):
+        cm0 = res.get("ctxmax") or {}
+        out.update(ctx_floor=res["floor"], floor_ok=(cm0.get("ctx") or 0) >= min(res["floor"], cm0.get("cap") or res["floor"]))
     sl = res.get("slots")
     if sl and sl.get("rows"):
         out.update(slots=sl["pick"], slot_rows=sl["rows"], slots_mode=sl.get("mode", "sweep"))
@@ -834,6 +1066,12 @@ def main():
     ap.add_argument("--dflash-head", help="a DFlash draft checkpoint: stage 5 tries it after MTP and keeps the faster. Default: none (no disk search)")
     ap.add_argument("--no-parallel", action="store_true", help="skip stage 6p, the 2 and 4 parallel-request runs (a report only)")
     ap.add_argument("--reserve-gib", default=os.environ.get("FT_FIT_RESERVE_GB", ""), help="FREETOKEN_DESKTOP_RESERVE_GB on every run: VRAM held back for the desktop (GiB, or auto). Default: none")
+    ap.add_argument("--ctx-floor", type=int, default=0, help="the context the config must hold (tokens): slots are picked as the fastest count whose KV reaches it. Default 0: --ctx, or 65536")
+    ap.add_argument("--tune", action="store_true", help="tune run: flags (winners run twice) and the parallel report on the plain config, saved to speedprobe/tune/<class>.json "
+                    "for every later fit of that model class. Writes no config to stamp")
+    ap.add_argument("--token-map", default="auto", help="stage 5: --speculative-token-map for the MTP winner. auto (default) = speedprobe/token-maps/<model>.bin, written once "
+                    "by scripts/make_token_map.py (tokenizer only, no GPU); off; or a file")
+    ap.add_argument("--no-kv8", action="store_true", help="skip the 8-bit KV row (one run, a report only; never in the launch line)")
     ap.add_argument("--result", help="write the winner as JSON here (the bench's ftfit test reads it); one model only")
     a = ap.parse_args()
     if (a.result or a.tag) and len(a.model) > 1:
@@ -864,7 +1102,7 @@ def main():
 
 def write_out(res: dict, a, m: str):
     os.makedirs(os.path.join(PROBE_OUT, "cards"), exist_ok=True)
-    cp = os.path.join(PROBE_OUT, "cards", f"{a.tag or slug(m)}.md")
+    cp = os.path.join(PROBE_OUT, "cards", f"{a.tag or slug(m)}{'-tune' if res.get('tune') else ''}.md")  # a tune run never overwrites a model's card
     with open(cp, "w", encoding="utf-8") as f:
         f.write(card(res))
     print(f"  card: {cp}")

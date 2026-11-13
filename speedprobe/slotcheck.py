@@ -1,45 +1,18 @@
-"""Offline check of ft-fit's slot sweep (stage 4s): Runner.run is replaced by made-up rows, nothing loads.
-usage: py speedprobe\\slotcheck.py   (prints the pick for three made-up cases and one card)
-2026-11-12: also the generalized flag stage, the parallel stage, --slots-mode auto and the DFlash head (undo: slotcheck.py.bak-20261112-stages).
-The made-up rows set every field themselves (slots_auto, per_req): no log file is read. The last line counts the failed checks."""
-import importlib.util, json, types
+"""Offline check of ft-fit's ladder: Runner.run is replaced by made-up rows, nothing loads, no GPU.
+usage: py speedprobe\\slotcheck.py   (the last line counts the failed checks)
+2026-11-13: rewritten for the flow rework (spec before slots, context floor, tune run, as-stamped final run, token map,
+8-bit KV row). The older version is slotcheck.py.bak-20261113-flow. Tune files go to a temp folder, never speedprobe/tune."""
+import importlib.util, json, os, tempfile, types
 
-sp = importlib.util.spec_from_file_location("fit", r"E:\freetoken-021\scripts\ft-fit.py")
+sp = importlib.util.spec_from_file_location("fit", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "ft-fit.py"))
 fit = importlib.util.module_from_spec(sp); sp.loader.exec_module(fit)
+TMP = tempfile.mkdtemp(prefix="slotcheck-")
+fit.TUNE_DIR = os.path.join(TMP, "tune")
 INV = {"model": r"X:\m.gguf", "experts": 256, "context_length": 262144, "verdict": "hybrid", "builtin_mtp": False, "sidecars": [],
        "mmproj": None, "ram_total_gib": 32, "arch": "a", "layers": 40, "experts_used": 8, "file_gib": 20, "experts_gib": 17,
        "dense_gib": 3, "expert_types": "IQ4_NL", "gate_up_q8_layers": [], "kv_bytes_per_token": 20000, "kv_gib_32k": 0.6,
        "mmproj_gib": None, "sidecar_exact": False, "host_need_text_gib": 20, "host_need_vision_gib": 20}
-
-
-def case(name, table, ask):
-    """table: slots -> (decode, prefill, kv)"""
-    def run(self, stage, label, args, tests="decode", vision=False, env=None, base_args=True, ctx=None):
-        n = int(args[args.index("--moe-cache-size") + 1]) if "--moe-cache-size" in args else 5000
-        d, p, kv = table[n]
-        r = {"stage": stage, "label": label, "args": args, "tests": tests, "vision": vision, "env": env or {}, "ok": d > 0,
-             "tps": {t: d for t in tests.split(",")}, "prefill": {"p5k": p}, "kv_tokens": kv, "text": "same", "min_ram_gib": 5,
-             "max_vram_gib": 15, "error": "boom"}
-        self.log.append(r); return r
-    fit.Runner.run = run
-    fit.load_flags = lambda: []
-    a = types.SimpleNamespace(max_runs=10, load_timeout=600, tag="slotcheck-" + name, ctx=65536, fresh=True, no_slots=False, reserve_gib="")
-    res = fit.ladder(INV, a); res.update(tag=a.tag, ctx=res.pop("ctx_used"))
-    w = fit.winner(res)
-    got = (w["slots"], w["cache"], "--moe-cache-size" in w["args"])
-    print(f"{name}: slots {w['slots']} cache {w['cache']} args [{w['args']}] {'OK' if got == (ask, ask, False) else 'WRONG, wanted ' + str(ask)}")
-    for n in res["notes"]: print("   note:", n)
-    return res
-
-
-case("all-fine", {5000: (88, 800, 40000), 4000: (88, 790, 90000), 3000: (87, 780, 140000), 2000: (86, 760, 190000)}, 2000)
-case("3000-slow", {5000: (88, 800, 40000), 4000: (87, 790, 90000), 3000: (70, 500, 140000), 2000: (60, 300, 190000)}, 4000)
-case("no-kv-gain", {5000: (88, 800, 40000), 4000: (88, 800, 40000), 3000: (88, 800, 40000), 2000: (88, 800, 40000)}, 5000)
-r = case("4000-fails", {5000: (88, 800, 40000), 4000: (0, 0, None), 3000: (88, 800, 1), 2000: (88, 800, 1)}, 5000)
-print(fit.card(case("all-fine", {5000: (88, 800, 40000), 4000: (88, 790, 90000), 3000: (87, 780, 140000), 2000: (86, 760, 190000)}, 2000))[:1500])
-
-
-# ---------- 2026-11-12: flags with values/metric, parallel stage, --slots-mode auto, DFlash ----------
+KV = {5000: 40000, 4000: 90000, 3000: 140000, 2000: 190000, 6500: 20000, 8000: 10000}
 BAD = []
 
 
@@ -48,104 +21,149 @@ def check(name, ok, detail=""):
     if not ok: BAD.append(name)
 
 
-def ladder2(name, edit, flags=(), **opts):
-    """edit(r, args, tests, env, base_args) changes a default good row (88 tok/s decode, 800 tok/s prefill, 40000 KV tokens) in place."""
+def slots_of(args): return int(args[args.index("--moe-cache-size") + 1]) if "--moe-cache-size" in args else 5000
+
+
+def go(name, edit=None, flags=(), inv=None, kv=None, **opts):
+    """One ladder on made-up rows. A row is good by default: 88 tok/s, 800 tok/s prefill, KV by slot count (table kv or KV).
+    edit(r, args, tests, env) changes it in place. Returns (res, winner, log)."""
+    table = {**KV, **(kv or {})}
+
     def run(self, stage, label, args, tests="decode", vision=False, env=None, base_args=True, ctx=None):
         ts = tests.split(",")
-        r = {"stage": stage, "label": label, "args": args, "tests": tests, "vision": vision, "env": env or {}, "ok": True,
-             "tps": {t: 88 for t in ts}, "prefill": {t: 800 for t in ts}, "kv_tokens": 40000, "text": "same", "min_ram_gib": 5,
-             "max_vram_gib": 15, "slots_auto": None, "base_args": base_args}
-        edit(r, args, tests, env or {}, base_args)
-        if not r["ok"]: r["error"] = "boom"
-        self.log.append(r); return r
+        r = {"stage": stage, "label": label, "args": list(args), "tests": tests, "vision": vision, "env": {**self.base_env, **(env or {})}, "ok": True,
+             "tps": {t: 88 for t in ts}, "prefill": {t: 800 for t in ts}, "kv_tokens": table.get(slots_of(args), 90000), "text": "same", "min_ram_gib": 5,
+             "max_vram_gib": 15, "slots_auto": None, "kv_short": False, "base_args": base_args, "ctx": ctx}
+        if edit: edit(r, args, tests, r["env"])
+        if not r["ok"]: r["error"] = r.get("error") or "boom"
+        self.runs += 1; self.log.append(r); return r
     fit.Runner.run = run
     fit.load_flags = lambda: [dict(f) for f in flags]
-    a = types.SimpleNamespace(**{**dict(max_runs=10, load_timeout=600, tag="slotcheck-" + name, ctx=65536, fresh=True, no_slots=True, reserve_gib="",
-                                        slots_mode="sweep", kv_reserve=0, dflash_head=None, no_parallel=True), **opts})
-    res = fit.ladder(INV, a); res.update(tag=a.tag, ctx=res.pop("ctx_used"))
-    return res, fit.winner(res), fit.card(res)
+    a = types.SimpleNamespace(**{**dict(max_runs=10, load_timeout=600, tag="slotcheck-" + name, ctx=65536, fresh=True, no_slots=False, reserve_gib=""), **opts})
+    res = fit.ladder(dict(inv or INV), a); res.update(tag=a.tag, ctx=res.pop("ctx_used"))
+    w = fit.winner(res)
+    for n in res["notes"]: print(f"   [{name}] note:", n[:230])
+    return res, w, res["log"]
 
 
-FETCH = {"id": "max-fetch", "kind": "arg", "name": "--moe-hybrid-max-fetch", "values": ["--moe-hybrid-max-fetch 2", "--moe-hybrid-max-fetch 4"],
-         "tests": "decode,p5k", "metric": "prefill:p5k", "lossless": True, "status": "safe"}
-arg = lambda args, k: args[args.index(k) + 1] if k in args else None
-early = lambda r: "confirm" not in r["label"] and "ctx" not in r["stage"]  # the made-up effect stays out of stages 7 and 8
+def stages(log, s): return [r for r in log if r["stage"] == s]
 
 
-def fetch(decode4):  # fetch 4: 5K prefill +10%, decode as given; fetch 2: no change
-    def edit(r, args, tests, env, base_args):
-        if arg(args, "--moe-hybrid-max-fetch") == "4" and early(r):
-            r["prefill"]["p5k"] = 880; r["tps"]["decode"] = decode4
-    return edit
+def clear_tune():
+    for f in os.listdir(fit.TUNE_DIR) if os.path.isdir(fit.TUNE_DIR) else []: os.remove(os.path.join(fit.TUNE_DIR, f))
 
 
-res, w, c = ladder2("flag-prefill-kept", fetch(88), [FETCH])
-f = res["flags"][0]
-check("flag prefill +10%, decode equal", f["keep"] and f["value"] == "--moe-hybrid-max-fetch 4" and w["args"].endswith("--moe-hybrid-max-fetch 4") and "**kept**" in c,
-      f"keep {f['keep']} args [{w['args']}]")
-for v in f["variants"]: print("   variant:", {k: v[k] for k in ("label", "value", "metric", "ref", "text_same", "pass")})
-print("   ref run:", [r["label"] for r in res["log"] if "-ref-" in r["label"]], "| result:", f["result"][:230])
-res, w, c = ladder2("flag-decode-drops", fetch(79.2), [FETCH])
-f = res["flags"][0]
-check("flag prefill +10%, decode -10%", not f["keep"] and "max-fetch" not in w["args"], f"keep {f['keep']} worse {f['variants'][1]['worse']} args [{w['args']}]")
-res, w, c = ladder2("flag-unknown", fetch(88), [dict(FETCH, lossless="unknown")])
-check("flag lossless unknown is only reported", not res["flags"][0]["keep"] and "reported only" in res["flags"][0]["result"])
-THREADS = [{"id": f"cpu-threads-{n}", "kind": "arg", "name": "--moe-cpu-threads", "value": f"--moe-cpu-threads {n}", "lossless": True, "status": "safe"} for n in (6, 8)]
+MTP = dict(INV, builtin_mtp=True)
+spec_on = lambda args: "--speculative-algorithm" in args
+
+# ---------- slots against the 64K floor ----------
+res, w, log = go("floor-down")
+fin = stages(log, "7-final")
+check("floor-down picks the first count that holds 64K", (w["slots"], w["cache"]) == (4000, 4000) and "--moe-cache-size" not in w["args"], f"slots {w['slots']}")
+check("floor-down: 3000 and 2000 never run", {slots_of(r["args"]) for r in stages(log, "6-slots")} == {5000, 4000})
+check("floor-down: final run carries the pick, 5K prompt, model-max context", len(fin) == 1 and slots_of(fin[0]["args"]) == 4000 and fin[0]["tests"] == "decode,p5k" and fin[0]["ctx"] == 262144)
+check("floor-down: floor met, context from the final run's KV", w["floor_ok"] is True and w["ctx"] == 90000 // 1024 * 1024 and w["ctx_floor"] == 65536, f"ctx {w['ctx']}")
+check("floor-down: no second load for the context stage", not [r for r in stages(log, "8-ctx") if r["tests"] == "decode"])
+card1 = fit.card(res)
+
+res, w, log = go("floor-up", lambda r, a, t, e: r["tps"].update(decode={5000: 88, 6500: 95, 8000: 96}.get(slots_of(a), 88)), kv={5000: 100000, 6500: 80000, 8000: 70000})
+check("floor-up: more slots while the floor holds and decode gains", w["slots"] == 6500 and w["cache"] == 6500, f"slots {w['slots']}")
+res, w, log = go("floor-up-kv", lambda r, a, t, e: r["tps"].update(decode=99 if slots_of(a) == 6500 else 88), kv={5000: 100000, 6500: 50000})
+check("floor-up: a faster count under the floor is refused", w["slots"] == 5000, f"slots {w['slots']}")
+res, w, log = go("floor-never", kv={5000: 40000, 4000: 45000, 3000: 50000, 2000: 55000})
+check("floor-never: most context kept, floor reported as not met", w["slots"] == 2000 and w["floor_ok"] is False and any("no slot count holds" in n for n in res["notes"]))
+res, w, log = go("4000-fails", lambda r, a, t, e: r.update(ok=slots_of(a) != 4000))
+check("4000 fails: 5000 kept", w["slots"] == 5000 and w["cache"] == 5000)
+res, w, log = go("floor-arg", ctx_floor=120000)
+check("--ctx-floor 120000: 3000 slots", w["slots"] == 3000 and w["ctx_floor"] == 120000, f"slots {w['slots']}")
+
+# ---------- spec before slots; token map ----------
+mtp = lambda r, a, t, e: r["tps"].update(decode=120) if spec_on(a) else None
+res, w, log = go("spec-first", mtp, inv=MTP)
+order = [r["stage"] for r in log]
+check("spec runs before the slot sweep", order.index("5-spec") < order.index("6-slots"))
+check("slots are swept on the spec config", all(spec_on(r["args"]) for r in stages(log, "6-slots")) and w["pick"] == "spec" and w["head"]["kind"] == "mtp" and w["slots"] == 4000)
+check("final run is the spec config with its slots", spec_on(stages(log, "7-final")[0]["args"]) and w["tps"] == 120 and w["final_tps"] == 120)
+res, w, log = go("spec-slower", lambda r, a, t, e: r["tps"].update(decode=60) if spec_on(a) else None, inv=MTP)
+check("a slower spec is dropped before the slots", not any(spec_on(r["args"]) for r in stages(log, "6-slots") + stages(log, "7-final")) and w["pick"] == "plain")
+tm = os.path.join(TMP, "map.bin"); open(tm, "wb").write(b"x")
+tmap = lambda gain: (lambda r, a, t, e: r["tps"].update(decode=gain if "--speculative-token-map" in a else 120) if spec_on(a) else None)
+res, w, log = go("tmap-kept", tmap(130), inv=MTP, token_map=tm)
+check("token map kept when faster", "--speculative-token-map" in w["args"] and w["tps"] == 130 and w["head"]["kind"] == "mtp", w["args"])
+res, w, log = go("tmap-same", tmap(121), inv=MTP, token_map=tm)
+check("token map dropped inside the noise band", "--speculative-token-map" not in w["args"])
+res, w, log = go("tmap-missing", mtp, inv=MTP, token_map=os.path.join(TMP, "nope.bin"))
+check("a missing token map file is a note, not a run", not any("--speculative-token-map" in r["args"] for r in log), str([n for n in res["notes"] if "map" in n])[:200])
+
+# ---------- tune run, then a fit that uses it ----------
+FLAGS = [{"id": "good", "kind": "env", "name": "FT_GOOD", "value": "1", "lossless": True, "status": "safe"},
+         {"id": "once", "kind": "env", "name": "FT_ONCE", "value": "1", "lossless": True, "status": "safe"},
+         {"id": "lossy", "kind": "arg", "name": "--lossy", "value": "--lossy 1", "lossless": False, "status": "safe"}]
+clear_tune()
+res, w, log = go("no-tune")
+check("no tune file: a note, no flag or parallel runs", any("no tune result" in n for n in res["notes"]) and not stages(log, "6-flag") and not stages(log, "6p-parallel") and w["flags"] == [])
 
 
-def threads(r, args, tests, env, base_args):
-    if arg(args, "--moe-cpu-threads") and early(r): r["tps"]["decode"] = {"6": 92, "8": 95}[arg(args, "--moe-cpu-threads")]
+def tune_edit(r, a, t, e):
+    if e.get("FT_GOOD"): r["tps"]["decode"] = 95
+    if e.get("FT_ONCE"): r["tps"]["decode"] = 95 if not r["label"].endswith("-again") else 88
+    if "--lossy" in a: r["tps"]["decode"] = 99
 
 
-res, w, c = ladder2("flag-same-name", threads, THREADS)
-check("two kept flags of one name: the better stays", [f["keep"] for f in res["flags"]] == [False, True] and w["args"].count("--moe-cpu-threads") == 1
-      and w["args"].endswith("threads 8"), f"args [{w['args']}]")
+res, w, log = go("tune", tune_edit, flags=FLAGS, tune=True)
+print("   tune stages:", sorted({r["stage"] for r in log}), "labels:", [r["label"] for r in log if r["label"].endswith("-again")])
+tf = json.load(open(os.path.join(fit.TUNE_DIR, "a-moe.json"), encoding="utf-8"))
+keep = {f["id"]: bool(f.get("keep")) for f in tf["flags"]}
+check("tune: a gain seen twice is kept; once, or lossy, is not", keep == {"good": True, "once": False, "lossy": False}, str(keep))
+check("tune: winners run twice", len([r for r in log if r["label"].endswith("-again")]) >= 2)
+check("tune: the parallel report is saved", bool((tf.get("parallel") or {}).get("rows")), str(tf.get("parallel"))[:160])
+check("tune: result is marked, has no config", w.get("tune") is True and "args" not in w and not stages(log, "7-final") and not stages(log, "5-spec"))
+card_t = fit.card(res)
+res, w, log = go("fit-after-tune", lambda r, a, t, e: r["tps"].update(decode=95) if e.get("FT_GOOD") else None)
+fin = stages(log, "7-final")
+check("fit after tune: kept flag is in the final run, and on the card", fin[0]["env"] == {"FT_GOOD": "1"} and w["env"] == {"FT_GOOD": "1"} and w["flags"] == ["good"], f"{fin[0]['env']} {w['env']} {w['flags']}")
+check("fit after tune: no flag before the final run", not any(r["env"] for r in log if r["stage"] not in ("7-final", "8-ctx", "8-kv8")))
+check("fit after tune: speed is the final run's", w["tps"] == 95 and w["ladder_tps"] == 88, f"{w['tps']} {w.get('ladder_tps')}")
+check("fit after tune: fill test and parallel report use the tune", all(r["env"] == {"FT_GOOD": "1"} for r in stages(log, "8-ctx")) and bool((w.get("parallel") or {}).get("rows"))
+      and (w.get("tune_from") or {}).get("class") == "a-moe", str(w.get("tune_from"))[:160])
+res, w, log = go("flags-hurt", lambda r, a, t, e: r["tps"].update(decode=70) if e.get("FT_GOOD") else None)
+check("tune flags that slow this model are dropped after one run without them", w["env"] == {} and w["flags"] == [] and w["tps"] == 88 and len(stages(log, "7-final")) == 2, f"{w['env']} {w['tps']} {len(stages(log, '7-final'))}")
+res, w, log = go("flags-break", lambda r, a, t, e: r.update(ok=not e.get("FT_GOOD")))
+check("tune flags that break the load are dropped", w["env"] == {} and w["confirm_ok"] and w["tps"] == 88, f"{w['env']} {w['confirm_ok']} {[r['label'] for r in stages(log, '7-final')]}")
+clear_tune()
 
+# ---------- final run: failures ----------
+res, w, log = go("final-kvshort", lambda r, a, t, e: r.update(ok=False, kv_short=True) if r["stage"] == "7-final" and r["ctx"] == 262144 else None)
+fin = stages(log, "7-final")
+check("final run: a KV shortfall lowers the context cap", len(fin) == 2 and fin[1]["ctx"] == 196608 and w["confirm_ok"], str([r["ctx"] for r in fin]))
+res, w, log = go("final-ratio", lambda r, a, t, e: r.update(ok=False) if r["stage"] == "7-final" and "0.80" in a else None)
+check("final run: another failure lowers the memory ratio, and the card follows", w["confirm_ok"] and "--memory-ratio 0.75" in w["args"], w["args"])
+res, w, log = go("final-dead", lambda r, a, t, e: r.update(ok=False) if r["stage"] == "7-final" else None)
+check("final run never passes: said so, ladder speed shown", w["confirm_ok"] is False and w["final_tps"] is None and w["tps"] == 88, f"{w['confirm_ok']} {w.get('final_tps')} {w['tps']}")
 
-def par(c2, c4, ok4=True):
-    def edit(r, args, tests, env, base_args):
-        n = arg(args, "--max-running-requests")
-        if n:
-            assert arg(args, "--cuda-graph-max-bs") == n and env.get("FT_GRAPH_MAX_BS") == n and tests == f"decode,c{n}", (args, env, tests)
-            r["tps"][f"c{n}"] = {"2": c2, "4": c4}[n]; r["per_req"] = {f"c{n}": [r["tps"][f"c{n}"] / int(n)] * int(n)}
-            r["ok"] = n != "4" or ok4
-    return edit
+# ---------- 8-bit KV row ----------
+kv8 = lambda r, a, t, e: r.update(kv_tokens=170000, text="other", tps={"decode": 85}) if "--kv-cache-dtype" in a else None
+res, w, log = go("kv8", kv8)
+k = w["kv8"] or {}
+check("8-bit KV: reported, never in the launch line", bool(k.get("ok")) and k.get("kv_tokens") == 170000 and "--kv-cache-dtype" not in w["args"] and "8-bit KV" in fit.card(res), str(k)[:220])
+res, w, log = go("kv8-fails", lambda r, a, t, e: r.update(ok=False, error="needs bfloat16") if "--kv-cache-dtype" in a else None)
+check("8-bit KV: a failed load is a row with its error, the card stays good", (w["kv8"] or {}).get("ok") is False and w["confirm_ok"], str(w["kv8"])[:200])
+res, w, log = go("kv8-off", no_kv8=True)
+check("--no-kv8 skips the row", w["kv8"] is None and not stages(log, "8-kv8"))
 
+# ---------- older stages still work ----------
+res, w, log = go("auto-slots", lambda r, a, t, e: r.update(slots_auto=3500) if "--moe-cache-auto" in a else None, slots_mode="auto")
+check("auto slots: the engine's count becomes the cache", w["slots"] == 3500 and w["cache"] == 3500, f"slots {w.get('slots')}")
+head = os.path.join(TMP, "dflash.bin"); open(head, "wb").write(b"x")
+res, w, log = go("dflash", lambda r, a, t, e: r["tps"].update(decode=140 if "dflash" in a else 120) if spec_on(a) else None, inv=MTP, dflash_head=head)
+check("DFlash faster than MTP: kept, swept and stamped", w["head"]["kind"] == "dflash" and all("dflash" in r["args"] for r in stages(log, "6-slots") + stages(log, "7-final")), str(w["head"]))
+res, w, log = go("dense", inv=dict(INV, experts=None))
+check("dense model: no slot sweep, final run still happens", not stages(log, "6-slots") and w["confirm_ok"] and w.get("slots") is None, f"{w.get('slots')} {w.get('cache')}")
+res, w, log = go("no-load", lambda r, a, t, e: r.update(ok=False))
+check("nothing loads: no config, no crash", w["ok"] is False and "No config loaded" in fit.card(res))
+res, w, log = go("reserve", reserve_gib="2")
+check("desktop reserve is on every run and in the card's env", all(r["env"].get("FREETOKEN_DESKTOP_RESERVE_GB") == "2" for r in log) and w["env"] == {"FREETOKEN_DESKTOP_RESERVE_GB": "2"}, str(w["env"]))
 
-for name, e, want in (("parallel 2:150 4:200", par(150, 200), 4), ("parallel 2:150 4:fails", par(150, 200, False), 2), ("parallel no gain", par(89, 88), 1)):
-    res, w, c = ladder2("par", e, no_parallel=False)
-    p = w["parallel"]
-    check(name, p["best_n"] == want and "max-running" not in w["args"] and "cuda-graph" not in w["args"] and "## Parallel requests" in c,
-          f"best_n {p['best_n']} rows {[(x['n'], x['ok'], x['total_tps']) for x in p['rows']]} args [{w['args']}]")
-print(c[c.index("## Parallel requests"):c.index("## Notes") if "## Notes" in c else None])
-res, w, c = ladder2("par-off", par(150, 200), no_parallel=True)
-check("--no-parallel", "parallel" not in w and not any(r["stage"] == "6p-parallel" for r in res["log"]))
-
-
-def auto(slots, seen):
-    def edit(r, args, tests, env, base_args):
-        if "--moe-cache-auto" in args:
-            seen.append((list(args), base_args, tests)); r["slots_auto"] = slots; r["kv_tokens"] = 120000
-    return edit
-
-
-seen = []
-res, w, c = ladder2("slots-auto", auto(3600, seen), no_slots=False, slots_mode="auto")
-a0, base0, t0 = seen[0]
-check("slots auto: the run", len(seen) == 1 and base0 is False and "--moe-cache-size" not in a0 and a0[:2] == ["--moe-cpu-layers", "auto"]
-      and arg(a0, "--kv-reserve-tokens") == "65536" and t0 == "decode,p5k", f"[{' '.join(a0)}] base_args {base0}")
-check("slots auto: card cache", w["cache"] == 3600 and w["slots"] == 3600 and "moe-cache" not in w["args"] and "--moe-cache-size 3600" in c and "**3600 slots**" in c,
-      f"cache {w['cache']} args [{w['args']}]")
-seen = []
-res, w, c = ladder2("slots-auto-unparsed", auto(None, seen), no_slots=False, slots_mode="auto", kv_reserve=32768)
-check("slots auto: count not in the log", w["cache"] == 5000 and arg(seen[0][0], "--kv-reserve-tokens") == "32768" and any("does not name" in n for n in res["notes"]),
-      f"cache {w['cache']}")
-
-
-def dfl(r, args, tests, env, base_args):
-    if arg(args, "--speculative-algorithm") == "dflash" and early(r): r["tps"]["decode"] = {"2": 100, "3": 120, "4": 110}[arg(args, "--speculative-num-steps")]
-
-
-res, w, c = ladder2("dflash", dfl, dflash_head=__file__)
-check("dflash head", w["pick"] == "spec" and w["head"] == {"kind": "dflash", "path": __file__, "steps": 3} and w["tps"] == 120, f"head kind {w['head']['kind']} k {w['head']['steps']} tps {w['tps']}")
-print(f"{len(BAD)} of the 2026-11-12 checks failed" + (": " + ", ".join(BAD) if BAD else ""))
+print("\n" + card1[:1700])
+print("\n" + card_t[:500])
+print(f"\n{len(BAD)} of the 2026-11-13 checks failed" + (": " + "; ".join(BAD) if BAD else ""))
