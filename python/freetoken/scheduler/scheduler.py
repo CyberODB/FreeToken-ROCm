@@ -118,7 +118,6 @@ class Scheduler(SchedulerIOMixin):
         # tombstone so an abort-before-admission request can never be resurrected after its
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
-        self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
         # (mark it, defer the free to _process_last_data) or not (free immediately). Stays None
@@ -374,7 +373,8 @@ class Scheduler(SchedulerIOMixin):
                     msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
                     req.stats.stamp_token(now)
                     reply.append(msg)
-                    if msg.finished:
+                    # a timings_per_token request gets the snapshot on every reply, growing
+                    if msg.finished or req.sampling_params.timings_per_token:
                         msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
                     finished = msg.finished
 
@@ -445,7 +445,8 @@ class Scheduler(SchedulerIOMixin):
             req.stats.draft_n += k
             req.stats.draft_n_accepted += min(n, emitted)
             reply.append(msg)
-            if msg.finished:
+            # a timings_per_token request gets the snapshot on every reply, growing
+            if msg.finished or req.sampling_params.timings_per_token:
                 msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
             req.commit_pending(n)
             self.cache_manager.rollback_tail(req, req.cached_len, cached + k + 1)
@@ -897,13 +898,11 @@ class Scheduler(SchedulerIOMixin):
         if self.spec is not None and batch.is_decode:
             batch.phase, batch.rows_per_req = "verify", self.config.decode_rows_per_req
         self.engine.graph_runner.pad_batch(batch)
-        self._forward_iter += 1
         if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
-            self.cache_manager.maybe_free_swa_out_of_window(
-                batch.reqs, forward_iter=self._forward_iter)
+            self.cache_manager.maybe_free_swa_out_of_window(batch.reqs)
             for req in batch.reqs:
                 req.decode_batch_idx += 1
         else:
