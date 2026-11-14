@@ -31,7 +31,7 @@ def go(name, edit=None, flags=(), inv=None, kv=None, **opts):
 
     def run(self, stage, label, args, tests="decode", vision=False, env=None, base_args=True, ctx=None):
         ts = tests.split(",")
-        r = {"stage": stage, "label": label, "args": list(args), "tests": tests, "vision": vision, "env": {**self.base_env, **(env or {})}, "ok": True,
+        r = {"key": json.dumps([label, list(args), tests, vision, base_args, ctx]), "stage": stage, "label": label, "args": list(args), "tests": tests, "vision": vision, "env": {**self.base_env, **(env or {})}, "ok": True,
              "tps": {t: 88 for t in ts}, "prefill": {t: 800 for t in ts}, "kv_tokens": table.get(slots_of(args), 90000), "text": "same", "min_ram_gib": 5,
              "max_vram_gib": 15, "slots_auto": None, "kv_short": False, "base_args": base_args, "ctx": ctx}
         if edit: edit(r, args, tests, r["env"])
@@ -62,7 +62,7 @@ fin = stages(log, "7-final")
 check("floor-down picks the first count that holds 64K", (w["slots"], w["cache"]) == (4000, 4000) and "--moe-cache-size" not in w["args"], f"slots {w['slots']}")
 check("floor-down: 3000 and 2000 never run", {slots_of(r["args"]) for r in stages(log, "6-slots")} == {5000, 4000})
 check("floor-down: final run carries the pick, 5K prompt, model-max context", len(fin) == 1 and slots_of(fin[0]["args"]) == 4000 and fin[0]["tests"] == "decode,p5k" and fin[0]["ctx"] == 262144)
-check("floor-down: floor met, context from the final run's KV", w["floor_ok"] is True and w["ctx"] == 90000 // 1024 * 1024 and w["ctx_floor"] == 65536, f"ctx {w['ctx']}")
+check("floor-down: floor met, context from the final run's KV", w["goal_ok"] is True and w["ctx"] == 90000 // 1024 * 1024 and w["ctx_goal"] == 65536 and w["ctx_floor"] == 32768 and w["ctx_verdict"] == "met", f"ctx {w['ctx']}")
 check("floor-down: no second load for the context stage", not [r for r in stages(log, "8-ctx") if r["tests"] == "decode"])
 card1 = fit.card(res)
 
@@ -71,7 +71,14 @@ check("floor-up: more slots while the floor holds and decode gains", w["slots"] 
 res, w, log = go("floor-up-kv", lambda r, a, t, e: r["tps"].update(decode=99 if slots_of(a) == 6500 else 88), kv={5000: 100000, 6500: 50000})
 check("floor-up: a faster count under the floor is refused", w["slots"] == 5000, f"slots {w['slots']}")
 res, w, log = go("floor-never", kv={5000: 40000, 4000: 45000, 3000: 50000, 2000: 55000})
-check("floor-never: most context kept, floor reported as not met", w["slots"] == 2000 and w["floor_ok"] is False and any("no slot count holds" in n for n in res["notes"]))
+# 2026-11-14: 55K is under the 64K goal but over the 32K floor: usable, "under goal"
+check("floor-never: most context kept, under goal (not failed)", w["slots"] == 2000 and w["goal_ok"] is False and w["floor_ok"] is True
+      and w["ctx_verdict"] == "under goal" and "**under goal**" in fit.card(res) and any("no slot count holds" in n for n in res["notes"]))
+res, w, log = go("floor-fail", kv={5000: 20000, 4000: 22000, 3000: 25000, 2000: 28000})
+check("under the 32K floor: failed, 8-bit KV rescue tried", w["floor_ok"] is False and w["ctx_verdict"] == "failed" and "Failed: context floor" in fit.card(res)
+      and bool(stages(log, "8-kv8")))
+res, w, log = go("goal-arg", ctx_goal=120000, ctx_floor=90000)
+check("--ctx-goal 120000 --ctx-floor 90000: 3000 slots, both reported", w["slots"] == 3000 and w["ctx_goal"] == 120000 and w["ctx_floor"] == 90000)
 res, w, log = go("4000-fails", lambda r, a, t, e: r.update(ok=slots_of(a) != 4000))
 check("4000 fails: 5000 kept", w["slots"] == 5000 and w["cache"] == 5000)
 res, w, log = go("floor-arg", ctx_floor=120000)
@@ -143,17 +150,20 @@ check("final run never passes: said so, ladder speed shown", w["confirm_ok"] is 
 
 # ---------- 8-bit KV row ----------
 kv8 = lambda r, a, t, e: r.update(kv_tokens=170000, text="other", tps={"decode": 85}) if "--kv-cache-dtype" in a else None
+os.environ["FT_FIT_KV8"] = "1"  # 2026-11-14: 8-bit KV runs on its own only as a floor rescue; these two force it
 res, w, log = go("kv8", kv8)
 k = w["kv8"] or {}
 check("8-bit KV: reported, never in the launch line", bool(k.get("ok")) and k.get("kv_tokens") == 170000 and "--kv-cache-dtype" not in w["args"] and "8-bit KV" in fit.card(res), str(k)[:220])
 res, w, log = go("kv8-fails", lambda r, a, t, e: r.update(ok=False, error="needs bfloat16") if "--kv-cache-dtype" in a else None)
 check("8-bit KV: a failed load is a row with its error, the card stays good", (w["kv8"] or {}).get("ok") is False and w["confirm_ok"], str(w["kv8"])[:200])
+os.environ.pop("FT_FIT_KV8", None)
 res, w, log = go("kv8-off", no_kv8=True)
 check("--no-kv8 skips the row", w["kv8"] is None and not stages(log, "8-kv8"))
 
 # ---------- older stages still work ----------
 res, w, log = go("auto-slots", lambda r, a, t, e: r.update(slots_auto=3500) if "--moe-cache-auto" in a else None, slots_mode="auto")
-check("auto slots: the engine's count becomes the cache", w["slots"] == 3500 and w["cache"] == 3500, f"slots {w.get('slots')}")
+# 2026-11-13: the card keeps --moe-cache-auto + the reserve, not the count it resolved to (free VRAM moves between loads)
+check("auto slots: the engine's count is reported, the card keeps --moe-cache-auto", w["slots"] == 3500 and "--moe-cache-auto" in w["args"], f"slots {w.get('slots')}")
 head = os.path.join(TMP, "dflash.bin"); open(head, "wb").write(b"x")
 res, w, log = go("dflash", lambda r, a, t, e: r["tps"].update(decode=140 if "dflash" in a else 120) if spec_on(a) else None, inv=MTP, dflash_head=head)
 check("DFlash faster than MTP: kept, swept and stamped", w["head"]["kind"] == "dflash" and all("dflash" in r["args"] for r in stages(log, "6-slots") + stages(log, "7-final")), str(w["head"]))

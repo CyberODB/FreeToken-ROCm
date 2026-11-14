@@ -25,6 +25,11 @@ Stages: 1 inventory/size check, 2 upgrades (MTP), 3 strategy, 4 memory ratio, 4s
   winner calls under 5% rerun both sides; dense class default --max-prefill-length 2048; the card's "What failed" section.
   Later the same day (undo: ft-fit.py.bak-20261114-slotroom): a hybrid run whose 5000 expert slots do not fit is retried once
   at the room the engine reports, and the squeeze never asks for more than that room.
+  Later still (undo: ft-fit.py.bak-20261114-goal): the context is a goal (--ctx-goal, 64K) over a floor (--ctx-floor, now
+  32K, was the goal): slots aim at the goal; met / under goal (usable) / failed (under the floor); 8-bit KV rescues only
+  under the floor.
+  Pre-flight (same undo): before any load, the model's arch and tensor types are checked against the engine's own tables
+  (stop with a reason, --no-preflight overrides) and every fixed slot count is capped at the model's expert total.
 Pass/fail comes from the probe's results.jsonl row (its exit code is 0 on a failed load), kills from the
 guard journal. Results go to speedprobe/fit/<model>.jsonl; a rerun reuses rows with the same name and args.
 Stdlib only, never imports torch.
@@ -125,6 +130,9 @@ def inventory(model: str, vram_gib: float, desktop_gib: float, extra_gib: float)
         if t["name"].endswith(".weight"):
             types[type_name(t["type"])] = types.get(type_name(t["type"]), 0) + 1
     by = {t["name"]: t["type"] for t in tensors}
+    # 2026-11-14: the engine's pool room is (layers with expert tensors) x expert_count (pool_policy.py), e.g. gemma4 30 x 128
+    moe_layers = {t["name"].split(".")[1] for t in exps if t["name"].startswith("blk.")}
+    expert_slots = len(moe_layers) * int(g("expert_count") or 0) or None
     odd = [L for L in range(int(g("block_count", 0) or 0))
            if f"blk.{L}.ffn_gate_exps.weight" in by and by[f"blk.{L}.ffn_gate_exps.weight"] != by.get(f"blk.{L}.ffn_up_exps.weight")]
     # KV per token (bf16 assumed): only full-attention layers hold KV in qwen35*/hybrid archs
@@ -163,7 +171,8 @@ def inventory(model: str, vram_gib: float, desktop_gib: float, extra_gib: float)
     return {
         "model": model, "arch": arch, "layers": layers, "experts": g("expert_count"), "experts_used": g("expert_used_count"),
         "file_gib": round(total_b / GIB, 2), "experts_gib": round(experts_b / GIB, 2), "dense_gib": round(dense, 2),
-        "expert_types": types, "gate_up_q8_layers": odd, "kv_bytes_per_token": kv_tok,
+        "expert_types": types, "gate_up_q8_layers": odd, "kv_bytes_per_token": kv_tok, "expert_slots": expert_slots,
+        "tensor_types": sorted({t["type"] for t in tensors}), "sliding_window": g("attention.sliding_window"),
         "kv_gib_8k": round(kv8k, 3), "kv_gib_32k": round((kv_tok or 0) * 32768 / GIB, 3),
         "context_length": g("context_length"), "mmproj": mmproj, "mmproj_gib": round(mm_b / GIB, 2),
         "builtin_mtp": builtin_mtp, "sidecars": sidecars, "sidecar_exact": sidecar_exact, "ram_total_gib": round(tot_ram, 1), "ram_avail_gib": round(avail, 1),
@@ -376,6 +385,70 @@ def decide(R: "Runner", new: dict | None, old: dict | None, notes: list[str], wh
 
 # ---------- ladder ----------
 
+ENGINE_PY = os.path.join(REPO, "python", "freetoken")
+
+
+def engine_archs() -> set[str] | None:
+    """2026-11-14: the GGUF architectures this engine can load (GGUF_ARCH_TO_REGISTRY in models/gguf/config.py), read as text
+    so ft-fit stays stdlib-only. None when the file or the dict is not found (then the check is skipped, not failed)."""
+    try:
+        src = open(os.path.join(ENGINE_PY, "models", "gguf", "config.py"), encoding="utf-8").read()
+    except OSError:
+        return None
+    m = re.search(r"GGUF_ARCH_TO_REGISTRY[^=]*=\s*\{(.*?)\n\}", src, re.S)
+    return set(re.findall(r'^\s*"([^"]+)"\s*:', m.group(1), re.M)) or None if m else None
+
+
+def engine_types() -> dict[int, str] | None:
+    """2026-11-14: ggml tensor type ids the engine's GGUF reader knows (GGMLQuantizationType in third_party/gguf/constants.py).
+    Knowing a type is not proof a kernel runs it, but an id missing here cannot load."""
+    try:
+        src = open(os.path.join(ENGINE_PY, "third_party", "gguf", "constants.py"), encoding="utf-8").read()
+    except OSError:
+        return None
+    m = re.search(r"class GGMLQuantizationType\(IntEnum\):\n(.*?)\n(?=\S)", src, re.S)
+    return {int(v): k for k, v in re.findall(r"^\s+([A-Z0-9_]+)\s*=\s*(\d+)", m.group(1), re.M)} or None if m else None
+
+
+def preflight(inv: dict) -> dict:
+    """2026-11-14: checks before the first GPU load, from the model file and the engine's own tables, so a model fails in
+    seconds with a reason instead of after a load (gemma4 IQ3_XS and LFM2 Q5_K_L failed on a fixed 5000 expert slots their
+    shape could never hold). stop = a load cannot work; warn = it may, but a number below is off."""
+    stop, warn = [], []
+    archs = engine_archs()
+    if archs is None:
+        warn.append("could not read the engine's architecture list (models/gguf/config.py); arch check skipped")
+    elif inv["arch"] not in archs:
+        stop.append(f"architecture '{inv['arch']}' is not in this engine's GGUF list ({', '.join(sorted(archs))}). "
+                    "A new architecture needs engine support first: check the engine and llama.cpp updates for it")
+    known = engine_types()
+    if known is None:
+        warn.append("could not read the engine's tensor type table (third_party/gguf/constants.py); type check skipped")
+    else:
+        bad = [t for t in inv.get("tensor_types") or [] if t not in known]
+        if bad:
+            stop.append(f"tensor type id(s) {', '.join(map(str, bad))} are not in the engine's GGUF type table: a newer quant format "
+                        "than this engine reads. Pick another quant, or update the engine")
+        new = [known[t] for t in inv.get("tensor_types") or [] if t in known and type_name(t) == str(t)]
+        if new:
+            warn.append(f"tensor type(s) {', '.join(new)} are new to ft-fit's reader (scripts/gguf_header.py): the engine knows them, "
+                        "but no fit here has run them yet")
+    es = inv.get("expert_slots")
+    if es and es < 5000:
+        warn.append(f"{es} expert slots in all ({es // int(inv.get('experts') or 1)} expert layers x {inv.get('experts')}): under the probe's "
+                    "5000, so runs use --moe-cache-auto and every slot count is capped at it")
+    if inv.get("sliding_window") and inv.get("kv_bytes_per_token"):
+        warn.append(f"sliding-window attention (window {inv['sliding_window']}): the KV estimate counts every layer at full "
+                    "context, so it is high; the loads report the real KV")
+    return {"stop": stop, "warn": warn}
+
+
+def slot_fit(inv: dict, counts) -> list[int]:
+    """2026-11-14: the slot counts at or under the model's expert total (a count above it cannot load)."""
+    es = inv.get("expert_slots")
+    return [n for n in counts if not es or n <= es]
+
+
 def slots_room_in(text: str) -> int | None:
     """2026-11-14: "MoE cache of 5000 slots exceeds what the pools can hold (3840 slots)" -> 3840."""
     m = re.findall(r"exceeds what the pools can hold \((\d+) slots\)", text or "")
@@ -470,7 +543,7 @@ def ladder(inv: dict, a) -> dict:
         base = ["--moe-strategy", "hybrid", "--memory-ratio", ratio]
         rooms = [n for n in (slots_room(r) for r in fails) if n]
         cap = min(rooms) if rooms else None  # 2026-11-14: the smallest slot room a ratio run reported
-        sq = min(3000, cap) if cap else 3000
+        sq = min([3000] + ([cap] if cap else []) + ([inv["expert_slots"]] if inv.get("expert_slots") else []))  # 2026-11-14: and the expert total
         steps = [("mr1" + (f"-s{cap}" if cap else ""), ["--max-running-requests", "1"] + (["--moe-cache-size", str(cap)] if cap else [])),
                  (f"mr1-s{sq}", ["--max-running-requests", "1", "--moe-cache-size", str(sq)]),
                  (f"mr1-s{sq}-naive", ["--max-running-requests", "1", "--moe-cache-size", str(sq), "--cache-type", "naive"])]
@@ -495,7 +568,11 @@ def ladder(inv: dict, a) -> dict:
         notes.append("no config loaded; see the errors above")
         return {"inv": inv, "ctx_used": R.ctx, "best": None, "spec": None, "flags": [], "confirm": None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
     plain = best
-    floor = int(getattr(a, "ctx_floor", 0) or a.ctx or 65536)
+    # 2026-11-14: the context is a goal (--ctx-goal, default --ctx or 65536) with a hard floor under it (--ctx-floor, default
+    # 32768): a fit between the two is "under goal", not failed. A floor over the goal raises the goal to it.
+    goal = int(getattr(a, "ctx_goal", 0) or a.ctx or 65536)
+    floor = int(getattr(a, "ctx_floor", 0) or min(32768, goal))
+    goal = max(goal, floor)
     if getattr(a, "tune", False):
         # --tune (2026-11-13): the machine-level settings, once per model class. Flags (each winner run twice) and the parallel
         # report on the plain ratio winner; saved to speedprobe/tune/<class>.json, which every later fit of the class reads.
@@ -568,11 +645,11 @@ def ladder(inv: dict, a) -> dict:
         notes.append("slot sweep skipped: the squeeze ladder or the slot-room retry fixed the slot count (" + use["args"][use["args"].index("--moe-cache-size") + 1] + ")")
     elif inv.get("experts") and "hybrid" in use["args"] and not a.no_slots:
         # 2026-11-13: a model with at most 5000 experts can't run the sweep (5000 and up exceed its pools), so it gets auto too
-        few = int(inv.get("layers") or 0) * int(inv.get("experts") or 0) <= 5000
+        few = int(inv.get("expert_slots") or int(inv.get("layers") or 0) * int(inv.get("experts") or 0)) <= 5000
         if getattr(a, "slots_mode", "sweep") == "auto" or few:  # 2026-11-12: one --moe-cache-auto run instead of the sweep
-            slots = slot_auto_stage(R, inv, use, notes, int(getattr(a, "kv_reserve", 0) or floor))
+            slots = slot_auto_stage(R, inv, use, notes, int(getattr(a, "kv_reserve", 0) or goal))
         else:
-            slots = slot_stage(R, inv, use, notes, floor)
+            slots = slot_stage(R, inv, use, notes, goal)
         if slots.get("row"):
             use = slots.pop("row")
     # flags and the parallel report come from the class's tune file (2026-11-13); a fit no longer runs them itself
@@ -631,15 +708,18 @@ def ladder(inv: dict, a) -> dict:
     stamped = dict(use, args=fargs)
     # stage 8: context on the as-stamped config (its load is the run above), then the 8-bit KV row
     ctxmax = ctx_stage(R, inv, stamped, vis_ok, notes, first=confirm if confirm and confirm.get("ok") else None, env=keep_env or None, cap=fcap)
-    if ctxmax.get("ctx") and ctxmax["ctx"] < floor:
-        notes.append(f"context {ctxmax['ctx']} is under the floor of {floor} tokens: this config does not meet the goal")
+    if ctxmax.get("ctx") and ctxmax["ctx"] < min(floor, fcap):
+        notes.append(f"context {ctxmax['ctx']} is under the floor of {floor} tokens: this config fails the context check")
+    elif ctxmax.get("ctx") and ctxmax["ctx"] < min(goal, fcap):
+        notes.append(f"context {ctxmax['ctx']} is under the goal of {goal} tokens but over the floor of {floor}: usable, labeled under goal")
     kv8 = None
     # 2026-11-14: 8-bit KV is a rescue, not a report on every fit: it runs only when the 16-bit KV misses the floor (or with
     # FT_FIT_KV8=1 / FT_FIT_KV8_SLOTS). It is lossy (ctx_rot on the 35B distill: 8K 7/10 vs 9/10 at 16-bit, and a hang in a
     # 30K prefill), so it never goes in the launch line: the card shows it as a separate, labeled line when it holds more.
     missed = (ctxmax.get("ctx") or 0) < min(floor, fcap)
     if confirm and confirm.get("ok") and not getattr(a, "no_kv8", False) and not (missed or os.environ.get("FT_FIT_KV8") == "1" or os.environ.get("FT_FIT_KV8_SLOTS")):
-        notes.append("8-bit KV not run: the 16-bit KV holds the context floor")
+        notes.append("8-bit KV not run: the 16-bit KV holds the context floor" + (
+            f" ({floor}), not the goal ({goal}); FT_FIT_KV8=1 runs it (lossy)" if (ctxmax.get("ctx") or 0) < min(goal, fcap) else ""))
     elif confirm and confirm.get("ok") and not getattr(a, "no_kv8", False):
         kv8 = kv8_row(R, stamped, vis_ok, keep_env or None, fcap, confirm, ctxmax)
         row8 = kv8.pop("_row", None)
@@ -650,14 +730,14 @@ def ladder(inv: dict, a) -> dict:
             kwin = dict(stamped, label=stamped["label"] + "-kv8", args=stamped["args"] + ["--kv-cache-dtype", KV8])
             kc = ctx_stage(R, inv, kwin, vis_ok, notes, first=row8, env=keep_env or None, cap=fcap)
             kv8.update(ctx=kc.get("ctx"), ctx_ok=kc.get("ok"), floor_ok=bool(kc.get("ok")) and (kc.get("ctx") or 0) >= min(floor, fcap),
-                       launch=kwin["args"])
+                       goal_ok=bool(kc.get("ok")) and (kc.get("ctx") or 0) >= min(goal, fcap), launch=kwin["args"])
             notes.append(f"8-bit KV rescue: {kc.get('ctx')} tokens " + ("confirmed by a fill test" if kc.get("ok") else "NOT confirmed")
                          + f" (16-bit: {ctxmax.get('ctx')}); floor {floor} " + ("met" if kv8["floor_ok"] else "still missed") + "; lossy, see the card")
         elif missed and kv8.get("ok"):
             notes.append(f"8-bit KV rescue: no real gain ({kv8.get('kv_tokens')} KV tokens vs {base_kv} at 16-bit); not offered")
         # 2026-11-14: FT_FIT_KV8_SLOTS=5500,6000 reruns those slot counts with 8-bit KV (half the KV per token, so more experts
         # fit over the floor). A report only, like the kv8 row: never the winner.
-        ks = [int(x) for x in os.environ.get("FT_FIT_KV8_SLOTS", "").split(",") if x.strip()]
+        ks = slot_fit(inv, [int(x) for x in os.environ.get("FT_FIT_KV8_SLOTS", "").split(",") if x.strip()])
         if ks and kv8.get("ok"):
             kcap = min(inv.get("context_length") or 262144, 524288) // 1024 * 1024
             R.max_runs += len(ks)
@@ -671,10 +751,10 @@ def ladder(inv: dict, a) -> dict:
                 if r is None:
                     break
                 kv8["slots"].append({"slots": n, "ok": r["ok"], "decode": tps(r) if r["ok"] else None, "prefill": (r.get("prefill") or {}).get("p5k"),
-                                     "kv_tokens": r.get("kv_tokens"), "floor_ok": (r.get("kv_tokens") or 0) >= floor,
+                                     "kv_tokens": r.get("kv_tokens"), "floor_ok": (r.get("kv_tokens") or 0) >= floor, "goal_ok": (r.get("kv_tokens") or 0) >= goal,
                                      "error": None if r["ok"] else str(r.get("error"))[:200]})
     return {"inv": inv, "ctx_used": R.ctx, "best": plain, "spec": spec, "use": use, "flags": flags_out, "confirm": confirm, "ctxmax": ctxmax,
-            "slots": slots, "parallel": par, "floor": floor, "kv8": kv8, "tune_from": {k: tune.get(k) for k in ("when", "model", "class")} if tune else None,
+            "slots": slots, "parallel": par, "floor": floor, "goal": goal, "kv8": kv8, "tune_from": {k: tune.get(k) for k in ("when", "model", "class")} if tune else None,
             "reserve": a.reserve_gib or None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
 
 
@@ -913,7 +993,7 @@ def slot_auto_stage(R: "Runner", inv: dict, win: dict, notes: list[str], reserve
 def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str], floor: int = 0) -> dict:
     """Stage 6 (was 4s; 2026-11-13: after spec, against a context floor): the expert GPU slots against the KV on the config the
     card will carry. Runs load at the model's own maximum context, so "Allocating N tokens for KV cache" is the real room.
-    The goal is the fastest config that holds `floor` tokens:
+    The goal is the fastest config that holds `floor` tokens (the context goal, 2026-11-14):
       5000 slots hold the floor -> try SLOTS_UP while the floor still holds and decode gains over SAME;
       they do not               -> step down SLOTS until the KV reaches the floor (speed is not weighed: the floor is the goal);
                                    if no count reaches it, the count with the most KV is kept and a note says so.
@@ -938,7 +1018,7 @@ def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str], floor: int =
     pick, kv = ref, ref.get("kv_tokens") or 0
     if floor:
         if kv >= floor:
-            for n in SLOTS_UP:
+            for n in slot_fit(inv, SLOTS_UP):
                 r = one(n)
                 if r is None:
                     break
@@ -946,14 +1026,14 @@ def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str], floor: int =
                     notes.append(f"slot sweep: {n} slots failed: {err(r)}; kept {out['pick']}")
                     break
                 if (r.get("kv_tokens") or 0) < floor:
-                    notes.append(f"slot sweep: {n} slots leave {r.get('kv_tokens')} KV tokens, under the floor of {floor}; kept {out['pick']}")
+                    notes.append(f"slot sweep: {n} slots leave {r.get('kv_tokens')} KV tokens, under the goal of {floor}; kept {out['pick']}")
                     break
                 if not decide(R, r, pick, notes, f"{n} slots vs {out['pick']}"):
                     notes.append(f"slot sweep: {n} slots is no faster ({tps(r)} vs {tps(pick)} tok/s); kept {out['pick']}")
                     break
                 pick, kv, out["pick"] = r, r["kv_tokens"], n
         else:
-            for n in SLOTS:
+            for n in slot_fit(inv, SLOTS):
                 r = one(n)
                 if r is None:
                     break
@@ -967,9 +1047,9 @@ def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str], floor: int =
                 if kv >= floor:
                     break
             if kv < floor:
-                notes.append(f"slot sweep: no slot count holds the floor of {floor} tokens; kept {out['pick']} slots ({kv} KV tokens), the most context found")
+                notes.append(f"slot sweep: no slot count holds the goal of {floor} tokens; kept {out['pick']} slots ({kv} KV tokens), the most context found")
             elif pick is not ref:
-                notes.append(f"slot sweep: {out['pick']} slots hold the floor ({kv} KV tokens) at {tps(pick)} tok/s; 5000 slots held {ref.get('kv_tokens')} at {tps(ref)}")
+                notes.append(f"slot sweep: {out['pick']} slots hold the goal ({kv} KV tokens) at {tps(pick)} tok/s; 5000 slots held {ref.get('kv_tokens')} at {tps(ref)}")
         out["kv_tokens"] = kv
         if pick is not ref:
             out["row"] = pick
@@ -978,7 +1058,7 @@ def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str], floor: int =
         notes.append(f"slot sweep: 5000 slots already hold the model's whole context ({cap}); nothing to trade")
         return out
     pre0 = (ref.get("prefill") or {}).get("p5k") or 0
-    for n in SLOTS:
+    for n in slot_fit(inv, SLOTS):
         r = one(n)
         if r is None:
             break
@@ -1070,7 +1150,7 @@ def serve_base(launch: list[str]) -> str:
 def advice(res: dict) -> list[str]:
     """2026-11-14: the card's 'What failed / try next / turned off' lines, keyed to what went wrong in this fit."""
     out: list[str] = []
-    log, notes, floor = res.get("log") or [], res.get("notes") or [], res.get("floor")
+    log, notes, floor, goal = res.get("log") or [], res.get("notes") or [], res.get("floor"), res.get("goal") or res.get("floor")
     fails = [r for r in log if not r.get("ok")]
     errs = [str(r.get("error")) for r in fails]
     # what the card's launch line already has: a tip naming one of those is left out, and a failure the fit got past is
@@ -1087,7 +1167,7 @@ def advice(res: dict) -> list[str]:
     if any(r.get("kv_short") for r in fails):
         moe = res["inv"].get("experts")
         out.append(head("not enough VRAM for the KV cache") + " on some loads. Try: " + tips(
-            ([("--moe-cache-size", "fewer expert slots (`--moe-cache-size 3000`)")] if moe else [("--embed-weights", "`--embed-weights host`"), ("", "a smaller quant")])
+            ([("--moe-cache-size", f"fewer expert slots (`--moe-cache-size {min(3000, res['inv'].get('expert_slots') or 3000)}`)")] if moe else [("--embed-weights", "`--embed-weights host`"), ("", "a smaller quant")])
             + [("--max-running-requests", "`--max-running-requests 1`"), ("--cache-type", "`--cache-type naive`"), ("--kv-cache-dtype", "8-bit KV (lossy)")]) + ".")
     rooms = sorted({n for n in (slots_room(r) for r in fails) if n})
     if rooms:
@@ -1113,7 +1193,14 @@ def advice(res: dict) -> list[str]:
     cm, k8 = res.get("ctxmax") or {}, res.get("kv8") or {}
     if floor and res.get("best") is not None and not res.get("tune") and cm.get("ctx") is None:
         out.append(f"**Not checked: context floor {floor}** (the context stage did not run). Rerun the fit with a bigger `--max-runs`.")
-    elif floor and res.get("best") is not None and not res.get("tune") and cm["ctx"] < min(floor, cm.get("cap") or floor):
+    elif floor and res.get("best") is not None and not res.get("tune") and ctx_verdict(res) == "under goal":
+        more = tips([("--moe-cache-size", "fewer expert slots") if res["inv"].get("experts") else ("--embed-weights", "`--embed-weights host`"),
+                     ("--max-running-requests", "`--max-running-requests 1`")])
+        tries = ([f"the 8-bit KV line below ({k8.get('ctx')} tokens, lossy)"] if k8.get("launch") else ["8-bit KV (lossy; rerun with `FT_FIT_KV8=1`)"]) \
+            + ([more] if more != "nothing left in this list" else []) + ["a smaller quant"]
+        out.append(f"**Under goal: context.** {cm.get('ctx')} tokens fit: over the floor of {floor}, under the goal of {goal}. "
+                   "The launch line is usable. For more context: " + ", ".join(tries) + ".")
+    elif floor and res.get("best") is not None and not res.get("tune") and ctx_verdict(res) == "failed":
         tries = []
         if k8.get("launch"):
             tries.append(f"the 8-bit KV rescue line below ({k8.get('ctx')} tokens, lossy)")
@@ -1121,9 +1208,19 @@ def advice(res: dict) -> list[str]:
             tries.append("8-bit KV gave no real gain here")
         more = tips([("--moe-cache-size", "fewer expert slots") if res["inv"].get("experts") else ("--embed-weights", "`--embed-weights host`"),
                      ("--max-running-requests", "`--max-running-requests 1`")])
-        tries += ([more] if more != "nothing left in this list" else []) + [f"or a lower floor (`--ctx-floor`, now {floor})"]
+        tries += ([more] if more != "nothing left in this list" else []) + ["a smaller quant", f"or a lower floor (`--ctx-floor`, now {floor})"]
         out.append(f"**Failed: context floor.** {cm.get('ctx')} of {floor} tokens fit. Try: " + ", ".join(tries) + ".")
     return out
+
+def ctx_verdict(res: dict) -> str | None:
+    """2026-11-14: "met" (the goal holds), "under goal" (the floor holds, the goal does not), "failed" (under the floor),
+    or None (no floor, or the context stage did not run). Both are capped at the model's own context length."""
+    cm, floor = res.get("ctxmax") or {}, res.get("floor")
+    if not floor or cm.get("ctx") is None:
+        return None
+    goal, cap = res.get("goal") or floor, cm.get("cap") or 1 << 30
+    return "met" if cm["ctx"] >= min(goal, cap) else "under goal" if cm["ctx"] >= min(floor, cap) else "failed"
+
 
 def card(res: dict) -> str:
     inv, best, spec, confirm = res["inv"], res["best"], res["spec"], res["confirm"]
@@ -1155,7 +1252,9 @@ def card(res: dict) -> str:
               f"- As-stamped run (decode + 5k prompt{', vision on' if vis_ok else ''}): " + (fmt(confirm) if confirm else "not run")]
         cm0 = res.get("ctxmax") or {}
         if res.get("floor"):
-            L += [f"- Context floor {res['floor']} tokens: " + ("**met**" if (cm0.get("ctx") or 0) >= min(res["floor"], cm0.get("cap") or res["floor"]) else "**NOT met**")
+            v = ctx_verdict(res)
+            L += [f"- Context goal {res.get('goal') or res['floor']} tokens, floor {res['floor']}: "
+                  + {"met": "**met**", "under goal": "**under goal** (over the floor: usable)", "failed": "**NOT met** (under the floor)"}.get(v, "not checked")
                   + f" ({cm0.get('ctx')} tokens fit)"]
         L += [""]
     adv = advice(res)
@@ -1186,7 +1285,7 @@ def card(res: dict) -> str:
             if k8.get("launch"):
                 L += [f"- **Rescue line**, if you need the context more than the accuracy: {k8.get('ctx')} tokens "
                       + ("(confirmed by a fill test)" if k8.get("ctx_ok") else "(NOT confirmed by a fill test)")
-                      + (", meets the floor" if k8.get("floor_ok") else ", still under the floor") + ":", "",
+                      + (", meets the goal" if k8.get("goal_ok") else ", meets the floor" if k8.get("floor_ok") else ", still under the floor") + ":", "",
                       "```", f"ft serve --model-path \"{inv['model']}\"{serve_base(k8['launch'])} {' '.join(k8['launch'])}", "```", ""]
             L += ["- Measured cost (ctx_rot, 35B distill, 2026-11-14): 8K 7/10 vs 9/10 at 16-bit (paraphrase decoys and a count), "
                   "and one hang in a 30K prefill. Use it when the 16-bit context is too short, not by default."]
@@ -1199,7 +1298,7 @@ def card(res: dict) -> str:
               + f". Loaded at context {sl['cap']}.", "", "| slots | decode tok/s | 5K prefill tok/s | KV tokens | max VRAM GiB |", "|---|---|---|---|---|"]
         L += [f"| {x['slots'] or 'auto'} | {x['decode'] if x['ok'] else 'FAIL'} | {x['prefill'] or ''} | {x['kv_tokens'] or ''} | {x['max_vram_gib'] or ''} |" for x in sl["rows"]]
     elif sl and sl.get("rows"):
-        rule = (f"the fastest count that holds the floor of {sl['floor']} KV tokens" if sl.get("floor") else
+        rule = (f"the fastest count that holds the goal of {sl['floor']} KV tokens" if sl.get("floor") else
                 f"lowest count within {int(SLOT_DECODE * 100)}% decode and {int(SLOT_PREFILL * 100)}% 5K prefill of 5000, while the KV still grew")
         L += ["", "## Expert slots against context", "", f"Picked **{sl['pick']} slots** ({rule}). Loaded at context {sl['cap']}.", "", "| slots | decode tok/s | 5K prefill tok/s | KV tokens | max VRAM GiB |", "|---|---|---|---|---|"]
         L += [f"| {x['slots']} | {x['decode'] if x['ok'] else 'FAIL'} | {x['prefill'] or ''} | {x['kv_tokens'] or ''} | {x['max_vram_gib'] or ''} |" for x in sl["rows"]]
@@ -1282,7 +1381,9 @@ def winner(res: dict) -> dict:
                flags=[f["id"] for f in res["flags"] if f.get("keep")], tune_from=res.get("tune_from"), kv8=res.get("kv8"))
     if res.get("floor"):
         cm0 = res.get("ctxmax") or {}
-        out.update(ctx_floor=res["floor"], floor_ok=(cm0.get("ctx") or 0) >= min(res["floor"], cm0.get("cap") or res["floor"]))
+        g = res.get("goal") or res["floor"]
+        out.update(ctx_floor=res["floor"], floor_ok=(cm0.get("ctx") or 0) >= min(res["floor"], cm0.get("cap") or res["floor"]),
+                   ctx_goal=g, goal_ok=(cm0.get("ctx") or 0) >= min(g, cm0.get("cap") or g), ctx_verdict=ctx_verdict(res))
     sl = res.get("slots")
     if sl and sl.get("rows"):
         out.update(slots=sl["pick"], slot_rows=sl["rows"], slots_mode=sl.get("mode", "sweep"))
@@ -1315,7 +1416,10 @@ def main():
     ap.add_argument("--dflash-head", help="a DFlash draft checkpoint: stage 5 tries it after MTP and keeps the faster. Default: none (no disk search)")
     ap.add_argument("--no-parallel", action="store_true", help="skip stage 6p, the 2 and 4 parallel-request runs (a report only)")
     ap.add_argument("--reserve-gib", default=os.environ.get("FT_FIT_RESERVE_GB", ""), help="FREETOKEN_DESKTOP_RESERVE_GB on every run: VRAM held back for the desktop (GiB, or auto). Default: none")
-    ap.add_argument("--ctx-floor", type=int, default=0, help="the context the config must hold (tokens): slots are picked as the fastest count whose KV reaches it. Default 0: --ctx, or 65536")
+    ap.add_argument("--no-preflight", action="store_true", help="run the GPU loads even when the pre-flight check (engine arch list, tensor types) says stop")
+    ap.add_argument("--ctx-goal", type=int, default=0, help="the context to aim for (tokens): slots are picked as the fastest count whose KV reaches it. Default 0: --ctx, or 65536")
+    ap.add_argument("--ctx-floor", type=int, default=0, help="the least context that still passes (tokens); between it and the goal the card says under goal. "
+                    "Default 0: 32768 (or the goal, if lower). A floor over the goal raises the goal")
     ap.add_argument("--tune", action="store_true", help="tune run: flags (winners run twice) and the parallel report on the plain config, saved to speedprobe/tune/<class>.json "
                     "for every later fit of that model class. Writes no config to stamp")
     ap.add_argument("--token-map", default="auto", help="stage 5: --speculative-token-map for the MTP winner. auto (default) = speedprobe/token-maps/<model>.bin, written once "
@@ -1334,9 +1438,17 @@ def main():
             print(json.dumps(inv))
         else:
             print_inventory(inv)
-        if a.plan_only or inv["verdict"] == "no-fit":
+        pf = inv["preflight"] = preflight(inv)
+        for w in pf["warn"]:
+            print("  pre-flight:", w)
+        for w in pf["stop"]:
+            print("  PRE-FLIGHT STOP:", w)
+        if pf["stop"] and not a.no_preflight:
+            inv["verdict"] = "unsupported"
+        if a.plan_only or inv["verdict"] in ("no-fit", "unsupported"):
             if not a.plan_only:
-                print("  stopping: the size check says it cannot fit")
+                print("  stopping: " + ("the pre-flight check says it cannot load (--no-preflight runs it anyway)" if inv["verdict"] == "unsupported"
+                                        else "the size check says it cannot fit"))
             if a.result:  # no runs: the size check alone
                 with open(a.result, "w", encoding="utf-8") as f:
                     json.dump({"model": m, "tag": a.tag or slug(m), "ctx": a.ctx or None, "verdict": inv["verdict"], "ok": False,
