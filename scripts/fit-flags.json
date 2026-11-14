@@ -25,10 +25,10 @@
   {"id": "cache-split-profile", "kind": "arg", "name": "--moe-cache-split", "value": "", "lossless": true, "status": "candidate",
    "note": "2026-11-12: needs --moe-cache-scope per-layer and a profile file {model, expert_counts[L][E]}; no tool writes one yet (FT_EXPERT_FREQ's decode matrix could be wrapped). Expert skew measured weak on the 35B, so low priority."},
   {"id": "kv-cache-fp8", "kind": "arg", "name": "--kv-cache-dtype", "value": "--kv-cache-dtype fp8_per_token_head", "lossless": false,
-   "status": "candidate",
+   "status": "handled", "handled_by": "2026-11-14: ft-fit stage 8, the 8-bit KV floor rescue (lossy: ctx_rot 8K 7/10 vs bf16 9/10)",
    "note": "2026-11-13 (upstream #894): 8-bit KV, about half the KV memory, so more context per GB. Lossy, so never auto-kept. Needs --dtype bfloat16; never loaded on ROCm. int8_per_token_head is the other format."},
-  {"id": "spec-token-map", "kind": "arg", "name": "--speculative-token-map", "value": "", "lossless": true, "status": "candidate",
-   "note": "2026-11-13 (upstream #892): MTP draft scores only the ids in a map file; target still verifies the whole vocabulary. Needs a file from scripts/make_token_map.py MODEL (tokenizer only) and belongs in the spec stage (MTP on), not here."},
+  {"id": "spec-token-map", "kind": "arg", "name": "--speculative-token-map", "value": "", "lossless": true, "status": "handled",
+   "handled_by": "2026-11-14: ft-fit stage 5, the token map step on the spec winner", "note": "2026-11-13 (upstream #892): MTP draft scores only the ids in a map file; target still verifies the whole vocabulary. Needs a file from scripts/make_token_map.py MODEL (tokenizer only) and belongs in the spec stage (MTP on), not here."},
   {"id": "online-quant-df11", "kind": "arg", "name": "--online-quant", "value": "--online-quant df11", "lossless": true, "status": "candidate",
    "note": "2026-11-13 (upstream #891): lossless ~11 bit packing of bf16 layers only, about 30% less VRAM for those, a decode per use. A GGUF-quantized model like the 35B IQ4_NL has few or no bf16 Linear layers, so probably refused there."}
 ]

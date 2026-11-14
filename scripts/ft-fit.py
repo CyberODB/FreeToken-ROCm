@@ -20,6 +20,9 @@ Stages: 1 inventory/size check, 2 upgrades (MTP), 3 strategy, 4 memory ratio, 4s
   -> 8 context fill on that run -> 8-kv8 one 8-bit KV row (report only; --no-kv8).
   Flags and the parallel report moved to --tune: once per model class, saved to speedprobe/tune/<class>.json, flag winners
   run twice. A normal fit reads that file and only checks the kept flags in its final run.
+2026-11-14 (undo: ft-fit.py.bak-20261114-fitflow): 4-squeeze when no hybrid ratio loads (mr1, then 3000 slots, then naive
+  cache; first that loads wins); 8-bit KV only as a rescue when 16-bit misses the floor (lossy, own launch line);
+  winner calls under 5% rerun both sides; dense class default --max-prefill-length 2048; the card's "What failed" section.
 Pass/fail comes from the probe's results.jsonl row (its exit code is 0 on a failed load), kills from the
 guard journal. Results go to speedprobe/fit/<model>.jsonl; a rerun reuses rows with the same name and args.
 Stdlib only, never imports torch.
@@ -49,6 +52,12 @@ SIDECAR_DIRS = [r"T:\ai-models\gguf\local"]
 FLAGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fit-flags.json")
 RATIOS = (0.80, 0.85, 0.90)
 SAME = 0.02  # gains under 2% are noise (doc 18: +-1-2 tok/s per 512-token run)
+CLOSE = 0.05  # 2026-11-14: a winner decision with a margin under 5% reruns both sides (repeats spread ~4%) and decides on the means
+# 2026-11-14: settings every fit of a class gets, measured, so they don't hang on one tune run. Dense: the 5K prefill went from
+# 193.5 to 359.8 tok/s (mean of 2) with a 2048 chunk (qwen38-27b 4.2bpw tune). Dropped like a tune flag if it slows decode.
+CLASS_DEFAULTS = {"dense": [{"id": "prefill-chunk-default", "kind": "arg", "name": "--max-prefill-length", "value": "--max-prefill-length 2048",
+                             "status": "default", "lossless": True, "keep": True,
+                             "result": "class default for dense models (5K prefill 193.5 -> 359.8 tok/s on qwen38-27b, 2026-11-14)"}]}
 # 2026-11-11 slot sweep (stage 4s): expert GPU slots traded for KV (context). 5000 is the probe's base; each step down is kept
 # while decode stays within SLOT_DECODE and the 5K prefill within SLOT_PREFILL of the 5000 run, and the KV keeps growing.
 SLOTS = (4000, 3000, 2000)
@@ -339,6 +348,27 @@ def better(new: dict | None, old: dict | None) -> bool:
     return tps(new) > tps(old) * (1 + SAME)
 
 
+def decide(R: "Runner", new: dict | None, old: dict | None, notes: list[str], what: str) -> bool:
+    """better(), except a close call (both ok, margin under CLOSE): both configs run once more and the means decide."""
+    if not (new and new.get("ok") and old and old.get("ok")):
+        return better(new, old)
+    a, b = tps(new), tps(old)
+    if abs(a - b) >= CLOSE * max(a, b):
+        return better(new, old)
+    R.max_runs += 2
+    means = []
+    for r in (new, old):
+        again = R.run(r["stage"], r["label"] + "-again", r["args"], tests=r["tests"], vision=r["vision"], env=r.get("env") or None,
+                      base_args=json.loads(r["key"])[5], ctx=r.get("ctx"))
+        means.append(round((tps(r) + tps(again)) / 2, 2) if again and again.get("ok") else None)
+    if None in means:
+        notes.append(f"close call, {what}: {a} vs {b} tok/s, a rerun did not pass; decided on the first runs")
+        return better(new, old)
+    win = means[0] > means[1] * (1 + SAME)
+    notes.append(f"close call, {what}: {a} vs {b} tok/s, so both ran twice; means {means[0]} vs {means[1]}: {'new' if win else 'old'} kept")
+    return win
+
+
 # ---------- ladder ----------
 
 def ladder(inv: dict, a) -> dict:
@@ -397,6 +427,31 @@ def ladder(inv: dict, a) -> dict:
             last = r
         if best is not None and strat == "fused":
             break  # fused works; hybrid only matters when fused does not
+    if best is None and "hybrid" in strategies:
+        # 2026-11-14: MoE squeeze ladder, like the dense one: when no ratio loads, give KV and the state pool more room, cheapest
+        # first; the first that loads wins. (No vision or context step: ladder runs have no vision, and the context is only a KV cap.)
+        fails = [r for r in R.log if r["stage"] == "4-ratio" and not r.get("ok")]
+        ram = any("available RAM" in str(r.get("error")) for r in fails)
+        ratio = f"{max(RATIOS) if fails and all(kv_short(r) for r in fails) else min(RATIOS):.2f}"
+        base = ["--moe-strategy", "hybrid", "--memory-ratio", ratio]
+        steps = [("mr1", ["--max-running-requests", "1"]),
+                 ("mr1-s3000", ["--max-running-requests", "1", "--moe-cache-size", "3000"]),
+                 ("mr1-s3000-naive", ["--max-running-requests", "1", "--moe-cache-size", "3000", "--cache-type", "naive"])]
+        if ram:
+            notes.append("MoE squeeze skipped: host RAM ran out (the guard stopped a run), and the squeeze steps only free VRAM")
+        else:
+            R.max_runs += len(steps)
+            for label, sargs in steps:
+                r = R.run("4-squeeze", f"hybrid-r{int(float(ratio) * 100)}-{label}", base + sargs)
+                if r is None:
+                    break
+                if r["ok"]:
+                    best = r
+                    notes.append(f"MoE squeeze: loaded with `{' '.join(sargs)}` at ratio {ratio}")
+                    break
+                notes.append(f"MoE squeeze {' '.join(sargs)} failed: {err(r)}")
+                if "available RAM" in str(r.get("error")):
+                    break
     if best is None:
         notes.append("no config loaded; see the errors above")
         return {"inv": inv, "ctx_used": R.ctx, "best": None, "spec": None, "flags": [], "confirm": None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
@@ -448,7 +503,7 @@ def ladder(inv: dict, a) -> dict:
             R.max_runs += 1
             r = R.run("5-spec", f"{spec['label']}-tmap", spec["args"] + ["--speculative-token-map", tm])
             if r is not None:
-                gain = r["ok"] and better(r, spec)
+                gain = r["ok"] and decide(R, r, spec, notes, "token map")
                 notes.append(f"token map ({os.path.basename(tm)}): " + (f"{tps(r)} vs {tps(spec)} tok/s, {'kept' if gain else 'not kept'}" if r["ok"] else f"failed: {err(r)}"))
                 if gain:
                     spec = r
@@ -461,11 +516,14 @@ def ladder(inv: dict, a) -> dict:
         notes.append(f"DFlash ladder k={list(dks)} (draft block size from its config.json)")
         dfl = spec_try("dflash", ["--speculative-draft-model-path", dhead], dks)
         if dfl is not None and spec is not None:
-            notes.append(f"spec decoding: MTP {tps(spec)} tok/s, DFlash {tps(dfl)} tok/s; {'DFlash' if better(dfl, spec) else 'MTP'} kept")
-        if dfl is not None and (spec is None or better(dfl, spec)):
+            dwin = decide(R, dfl, spec, notes, "DFlash vs MTP")
+            notes.append(f"spec decoding: MTP {tps(spec)} tok/s, DFlash {tps(dfl)} tok/s; {'DFlash' if dwin else 'MTP'} kept")
+            if dwin:
+                spec = dfl
+        elif dfl is not None:
             spec = dfl
     # 2026-11-13: `use` is the config the card will carry. Slots are traded on it (after spec, which takes VRAM), not on plain.
-    use = spec if spec and better(spec, plain) else plain
+    use = spec if spec and decide(R, spec, plain, notes, "spec vs plain decode") else plain
     slots = None
     if inv.get("experts") and "hybrid" in use["args"] and not a.no_slots:
         # 2026-11-13: a model with at most 5000 experts can't run the sweep (5000 and up exceed its pools), so it gets auto too
@@ -484,7 +542,11 @@ def ladder(inv: dict, a) -> dict:
         notes.append(f"flags from the tune run of {tune.get('when')} on {os.path.basename(str(tune.get('model')))} (class {tune.get('class')}): "
                      + (", ".join(f"`{f['value']}`" if f["kind"] == "arg" else f"{f['name']}={f['value']}" for f in flags_out) or "none kept"))
     else:
-        notes.append(f"no tune result for class {model_class(inv)}: no flags applied. Run once with --tune (BENCH_FT_FIT_TUNE=1).")
+        notes.append(f"no tune result for class {model_class(inv)}: no tune flags applied. Run once with --tune (BENCH_FT_FIT_TUNE=1).")
+    for d in CLASS_DEFAULTS.get("moe" if inv.get("experts") else "dense", []):  # 2026-11-14: unless the tune kept a value of the same flag
+        if not any(f["kind"] == d["kind"] and f["name"] == d["name"] for f in flags_out):
+            flags_out.append(dict(d))
+            notes.append(f"class default applied: `{d['value']}` ({d['result']})")
     # stage 7: the config as stamped, in one run: winner + kept flags, vision if present, a 5K prompt, at the model's own
     # maximum context (so its KV is the real room). Its numbers are the card's.
     vis = bool(inv["mmproj"])
@@ -531,8 +593,27 @@ def ladder(inv: dict, a) -> dict:
     if ctxmax.get("ctx") and ctxmax["ctx"] < floor:
         notes.append(f"context {ctxmax['ctx']} is under the floor of {floor} tokens: this config does not meet the goal")
     kv8 = None
-    if confirm and confirm.get("ok") and not getattr(a, "no_kv8", False):
+    # 2026-11-14: 8-bit KV is a rescue, not a report on every fit: it runs only when the 16-bit KV misses the floor (or with
+    # FT_FIT_KV8=1 / FT_FIT_KV8_SLOTS). It is lossy (ctx_rot on the 35B distill: 8K 7/10 vs 9/10 at 16-bit, and a hang in a
+    # 30K prefill), so it never goes in the launch line: the card shows it as a separate, labeled line when it holds more.
+    missed = (ctxmax.get("ctx") or 0) < min(floor, fcap)
+    if confirm and confirm.get("ok") and not getattr(a, "no_kv8", False) and not (missed or os.environ.get("FT_FIT_KV8") == "1" or os.environ.get("FT_FIT_KV8_SLOTS")):
+        notes.append("8-bit KV not run: the 16-bit KV holds the context floor")
+    elif confirm and confirm.get("ok") and not getattr(a, "no_kv8", False):
         kv8 = kv8_row(R, stamped, vis_ok, keep_env or None, fcap, confirm, ctxmax)
+        row8 = kv8.pop("_row", None)
+        kv8["rescue"] = missed
+        base_kv = kv8.get("base_kv_tokens") or 0
+        if missed and kv8.get("ok") and (kv8.get("kv_tokens") or 0) > base_kv * 1.2:
+            # it really holds more: confirm with a prompt that fills it (fp8 has hung on a long prefill), on its own labels
+            kwin = dict(stamped, label=stamped["label"] + "-kv8", args=stamped["args"] + ["--kv-cache-dtype", KV8])
+            kc = ctx_stage(R, inv, kwin, vis_ok, notes, first=row8, env=keep_env or None, cap=fcap)
+            kv8.update(ctx=kc.get("ctx"), ctx_ok=kc.get("ok"), floor_ok=bool(kc.get("ok")) and (kc.get("ctx") or 0) >= min(floor, fcap),
+                       launch=kwin["args"])
+            notes.append(f"8-bit KV rescue: {kc.get('ctx')} tokens " + ("confirmed by a fill test" if kc.get("ok") else "NOT confirmed")
+                         + f" (16-bit: {ctxmax.get('ctx')}); floor {floor} " + ("met" if kv8["floor_ok"] else "still missed") + "; lossy, see the card")
+        elif missed and kv8.get("ok"):
+            notes.append(f"8-bit KV rescue: no real gain ({kv8.get('kv_tokens')} KV tokens vs {base_kv} at 16-bit); not offered")
         # 2026-11-14: FT_FIT_KV8_SLOTS=5500,6000 reruns those slot counts with 8-bit KV (half the KV per token, so more experts
         # fit over the floor). A report only, like the kv8 row: never the winner.
         ks = [int(x) for x in os.environ.get("FT_FIT_KV8_SLOTS", "").split(",") if x.strip()]
@@ -617,7 +698,7 @@ def kv8_row(R: "Runner", win: dict, vis: bool, env: dict | None, cap: int, confi
     if r is not None:
         out.update(ok=bool(r["ok"]), kv_tokens=r.get("kv_tokens"), decode=tps(r) if r["ok"] else None, base_decode=tps(confirm),
                    text_same=bool(r["ok"] and r.get("text") == confirm.get("text")), max_vram_gib=r.get("max_vram_gib"),
-                   error=None if r["ok"] else str(r.get("error"))[:300])
+                   error=None if r["ok"] else str(r.get("error"))[:300], _row=r)
     return out
 
 
@@ -653,6 +734,8 @@ def flag_stage(R: "Runner", inv: dict, plain: dict) -> list[dict]:
         if not inv.get("experts") and "moe" in fl["name"].lower():
             out.append({**fl, "result": "not run (MoE-only flag; dense model)"})
             continue
+        if fl.get("status") == "handled":
+            continue  # 2026-11-14: run by its own stage (kv8 rescue, token map), so the card's flag list leaves it out
         if fl.get("status") != "safe":
             out.append({**fl, "result": f"not run ({fl.get('status')})"})
             continue
@@ -824,7 +907,7 @@ def slot_stage(R: "Runner", inv: dict, win: dict, notes: list[str], floor: int =
                 if (r.get("kv_tokens") or 0) < floor:
                     notes.append(f"slot sweep: {n} slots leave {r.get('kv_tokens')} KV tokens, under the floor of {floor}; kept {out['pick']}")
                     break
-                if not better(r, pick):
+                if not decide(R, r, pick, notes, f"{n} slots vs {out['pick']}"):
                     notes.append(f"slot sweep: {n} slots is no faster ({tps(r)} vs {tps(pick)} tok/s); kept {out['pick']}")
                     break
                 pick, kv, out["pick"] = r, r["kv_tokens"], n
@@ -936,6 +1019,60 @@ def load_flags() -> list[dict]:
 
 # ---------- card ----------
 
+def serve_base(launch: list[str]) -> str:
+    """The probe's base args a hybrid launch line needs in front (a fused one needs none)."""
+    if "fused" in launch:
+        return ""
+    return " --moe-cpu-layers auto" + ("" if "--moe-cache-size" in launch or "--moe-cache-auto" in launch else " --moe-cache-size 5000")
+
+
+def advice(res: dict) -> list[str]:
+    """2026-11-14: the card's 'What failed / try next / turned off' lines, keyed to what went wrong in this fit."""
+    out: list[str] = []
+    log, notes, floor = res.get("log") or [], res.get("notes") or [], res.get("floor")
+    fails = [r for r in log if not r.get("ok")]
+    errs = [str(r.get("error")) for r in fails]
+    if res.get("best") is None:
+        out.append("**Failed: nothing loaded.** " + (f"Last error: {err(fails[-1])[:300]}" if fails else "No run finished (run budget?)."))
+    if any("available RAM" in e for e in errs):
+        out.append("**Failed: host RAM ran low** (the guard stopped a run). Try: close other apps, turn off vision (`--mm-disable vision`), "
+                   "or `--max-running-requests 1`.")
+    if any(r.get("kv_short") for r in fails):
+        out.append("**Failed: not enough VRAM for the KV cache** on some loads. Try: "
+                   + ("fewer expert slots (`--moe-cache-size 3000`), " if res["inv"].get("experts") else "`--embed-weights host`, a smaller quant, ")
+                   +
+                   "`--max-running-requests 1`, `--cache-type naive`, or 8-bit KV (lossy).")
+    logs = [m[1] for e in errs for m in [re.search(r"exited \(15\).*?see (\S+)", e)] if m]
+    if logs:
+        out.append(f"**Failed: the server died during load** on {len(logs)} run(s) (exit 15). First log: `{logs[0]}`")
+    spec_fail = [n for n in notes if re.match(r"(MTP|DFlash) k=\d+ failed", n)]
+    if spec_fail and not res.get("spec"):
+        out.append(f"**Turned off: spec decoding** ({spec_fail[0][:200]}). The card uses plain decode.")
+    elif spec_fail:
+        out.append(f"**Failed: a higher spec step** ({spec_fail[0][:160]}); the lower one is kept.")
+    if any("vision does not fit" in n for n in notes):
+        out.append("**Turned off: vision.** It does not fit with this config; `--mm-disable vision` is in the launch line. "
+                   "Try: fewer expert slots or a lower ratio to make room, if you need it.")
+    if any(n.startswith("tune flags dropped") for n in notes):
+        out.append("**Turned off: the tune/class flags.** They slowed this model; the launch line runs without them.")
+    confirm = res.get("confirm")
+    if res.get("best") is not None and not res.get("tune") and not (confirm and confirm.get("ok")):
+        out.append(f"**Failed: the as-stamped run** ({err(confirm)[:200]}); the card's numbers are ladder runs." if confirm
+                   else "**Not run: the as-stamped run** (run budget spent); the card's numbers are ladder runs.")
+    cm, k8 = res.get("ctxmax") or {}, res.get("kv8") or {}
+    if floor and res.get("best") is not None and not res.get("tune") and cm.get("ctx") is None:
+        out.append(f"**Not checked: context floor {floor}** (the context stage did not run). Rerun the fit with a bigger `--max-runs`.")
+    elif floor and res.get("best") is not None and not res.get("tune") and cm["ctx"] < min(floor, cm.get("cap") or floor):
+        tries = []
+        if k8.get("launch"):
+            tries.append(f"the 8-bit KV rescue line below ({k8.get('ctx')} tokens, lossy)")
+        elif k8.get("ok"):
+            tries.append("8-bit KV gave no real gain here")
+        tries += ["fewer expert slots (MoE)" if res["inv"].get("experts") else "`--embed-weights host`",
+                  "`--max-running-requests 1`", f"or a lower floor (`--ctx-floor`, now {floor})"]
+        out.append(f"**Failed: context floor.** {cm.get('ctx')} of {floor} tokens fit. Try: " + ", ".join(tries) + ".")
+    return out
+
 def card(res: dict) -> str:
     inv, best, spec, confirm = res["inv"], res["best"], res["spec"], res["confirm"]
     name = os.path.basename(inv["model"])
@@ -954,7 +1091,7 @@ def card(res: dict) -> str:
         keep_args = [x for f in res["flags"] if f.get("keep") and f["kind"] == "arg" for x in f["value"].split()]
         vis_ok = confirm is not None and confirm.get("ok") and confirm.get("vision")
         launch = win["args"] + keep_args + ([] if vis_ok or not inv["mmproj"] else ["--mm-disable", "vision"])
-        base = "" if "fused" in win["args"] else " --moe-cpu-layers auto" + ("" if "--moe-cache-size" in launch or "--moe-cache-auto" in launch else " --moe-cache-size 5000")
+        base = serve_base(launch)
         L += ["## Recommended launch", "", "```", f"ft serve --model-path \"{inv['model']}\"{base} {' '.join(launch)}", "```", ""]
         if res.get("reserve"):
             L += [f"Fitted with FREETOKEN_DESKTOP_RESERVE_GB={res['reserve']} on every run (VRAM held back for the desktop); serve with the same value.", ""]
@@ -969,6 +1106,9 @@ def card(res: dict) -> str:
             L += [f"- Context floor {res['floor']} tokens: " + ("**met**" if (cm0.get("ctx") or 0) >= min(res["floor"], cm0.get("cap") or res["floor"]) else "**NOT met**")
                   + f" ({cm0.get('ctx')} tokens fit)"]
         L += [""]
+    adv = advice(res)
+    if adv:  # 2026-11-14: what failed, what to try, what was turned off, so a model with no card still gets a direction
+        L += ["## What failed / try next / turned off", ""] + [f"- {x}" for x in adv] + [""]
     L += ["## Model", "", f"- {inv['arch']}, {inv['layers']} layers, {inv['experts']} experts ({inv['experts_used']} used), file {inv['file_gib']} GiB "
           f"(experts {inv['experts_gib']}, dense {inv['dense_gib']})", f"- Expert tensors: {inv['expert_types']}"
           + (f"; gate!=up layers {inv['gate_up_q8_layers']} load as Q8_0" if inv["gate_up_q8_layers"] else ""),
@@ -985,12 +1125,19 @@ def card(res: dict) -> str:
               f"(engine KV {cm['kv_tokens']} tokens; model max {cm['cap']}); fill test {cm.get('fill_k')}K prompt"
               + (f", {cm['tps']} tok/s decode at that depth" if cm.get("tps") else "")]
     k8 = res.get("kv8")
-    if k8:  # 2026-11-13: a report only
+    if k8:  # 2026-11-13: a report only; 2026-11-14: run only as a floor rescue, with its own launch line when it holds more
         L += ["", "## 8-bit KV (lossy, not in the launch line)", ""]
         if k8.get("ok"):
             L += [f"- `--kv-cache-dtype {k8['format']}` on the as-stamped config: KV **{k8.get('kv_tokens')} tokens** (16-bit: {k8.get('base_kv_tokens')}), "
-                  f"decode {k8.get('decode')} tok/s (16-bit: {k8.get('base_decode')}), text {'identical' if k8.get('text_same') else 'DIFFERS'} on the decode test.",
-                  "- It changes what the model sees of its own context, so adding it is your call; the decode test is too short to judge quality."]
+                  f"decode {k8.get('decode')} tok/s (16-bit: {k8.get('base_decode')}); decode-test text {'identical' if k8.get('text_same') else 'worded differently'} "
+                  "(an exact-text check: different wording is expected and says nothing about accuracy)."]
+            if k8.get("launch"):
+                L += [f"- **Rescue line**, if you need the context more than the accuracy: {k8.get('ctx')} tokens "
+                      + ("(confirmed by a fill test)" if k8.get("ctx_ok") else "(NOT confirmed by a fill test)")
+                      + (", meets the floor" if k8.get("floor_ok") else ", still under the floor") + ":", "",
+                      "```", f"ft serve --model-path \"{inv['model']}\"{serve_base(k8['launch'])} {' '.join(k8['launch'])}", "```", ""]
+            L += ["- Measured cost (ctx_rot, 35B distill, 2026-11-14): 8K 7/10 vs 9/10 at 16-bit (paraphrase decoys and a count), "
+                  "and one hang in a 30K prefill. Use it when the 16-bit context is too short, not by default."]
         else:
             L += [f"- `--kv-cache-dtype {k8['format']}` did not run: {k8.get('error') or 'skipped (run budget)'}"]
     sl = res.get("slots")
@@ -1032,7 +1179,7 @@ def winner(res: dict) -> dict:
     inv, best, spec, confirm = res["inv"], res["best"], res["spec"], res["confirm"]
     out = {"model": inv["model"], "tag": res.get("tag"), "ctx": res.get("ctx") or None, "verdict": inv["verdict"],
            "when": time.strftime("%Y-%m-%d %H:%M"), "runs": res.get("runs", 0), "reused": res.get("reused", 0),
-           "notes": res["notes"], "ok": best is not None}
+           "notes": res["notes"], "ok": best is not None, "advice": advice(res)}
     if best is None:
         return out
     if res.get("tune"):  # 2026-11-13: a tune run has no config to stamp; OpenFT and the bench skip the card for it
