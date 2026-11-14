@@ -533,6 +533,24 @@ def ladder(inv: dict, a) -> dict:
     kv8 = None
     if confirm and confirm.get("ok") and not getattr(a, "no_kv8", False):
         kv8 = kv8_row(R, stamped, vis_ok, keep_env or None, fcap, confirm, ctxmax)
+        # 2026-11-14: FT_FIT_KV8_SLOTS=5500,6000 reruns those slot counts with 8-bit KV (half the KV per token, so more experts
+        # fit over the floor). A report only, like the kv8 row: never the winner.
+        ks = [int(x) for x in os.environ.get("FT_FIT_KV8_SLOTS", "").split(",") if x.strip()]
+        if ks and kv8.get("ok"):
+            kcap = min(inv.get("context_length") or 262144, 524288) // 1024 * 1024
+            R.max_runs += len(ks)
+            kv8["slots"] = []
+            seen: dict[int, int] = {}
+            for n in ks:  # a count listed again is a repeat run (label -r2, -r3, ...), for the spread
+                seen[n] = seen.get(n, 0) + 1
+                rep = f"-r{seen[n]}" if seen[n] > 1 else ""
+                r = R.run("8-kv8s", f"{stamped['label']}-kv8-s{n}{rep}",stamped["args"] + ["--kv-cache-dtype", KV8, "--moe-cache-size", str(n)],
+                          tests="decode,p5k", env=keep_env or None, ctx=kcap)
+                if r is None:
+                    break
+                kv8["slots"].append({"slots": n, "ok": r["ok"], "decode": tps(r) if r["ok"] else None, "prefill": (r.get("prefill") or {}).get("p5k"),
+                                     "kv_tokens": r.get("kv_tokens"), "floor_ok": (r.get("kv_tokens") or 0) >= floor,
+                                     "error": None if r["ok"] else str(r.get("error"))[:200]})
     return {"inv": inv, "ctx_used": R.ctx, "best": plain, "spec": spec, "use": use, "flags": flags_out, "confirm": confirm, "ctxmax": ctxmax,
             "slots": slots, "parallel": par, "floor": floor, "kv8": kv8, "tune_from": {k: tune.get(k) for k in ("when", "model", "class")} if tune else None,
             "reserve": a.reserve_gib or None, "notes": notes, "log": R.log, "runs": R.runs, "reused": R.reused}
