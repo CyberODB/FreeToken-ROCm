@@ -360,9 +360,10 @@ def decide(R: "Runner", new: dict | None, old: dict | None, notes: list[str], wh
     for r in (new, old):
         again = R.run(r["stage"], r["label"] + "-again", r["args"], tests=r["tests"], vision=r["vision"], env=r.get("env") or None,
                       base_args=json.loads(r["key"])[5], ctx=r.get("ctx"))
-        means.append(round((tps(r) + tps(again)) / 2, 2) if again and again.get("ok") else None)
-    if None in means:
-        notes.append(f"close call, {what}: {a} vs {b} tok/s, a rerun did not pass; decided on the first runs")
+        means.append(round((tps(r) + tps(again)) / 2, 2) if again and again.get("ok") else ("skipped" if again is None else None))
+    if "skipped" in means or None in means:
+        why = "a rerun was not run (run budget spent)" if "skipped" in means else "a rerun failed"
+        notes.append(f"close call, {what}: {a} vs {b} tok/s, {why}; decided on the first runs")
         return better(new, old)
     win = means[0] > means[1] * (1 + SAME)
     notes.append(f"close call, {what}: {a} vs {b} tok/s, so both ran twice; means {means[0]} vs {means[1]}: {'new' if win else 'old'} kept")
@@ -525,7 +526,9 @@ def ladder(inv: dict, a) -> dict:
     # 2026-11-13: `use` is the config the card will carry. Slots are traded on it (after spec, which takes VRAM), not on plain.
     use = spec if spec and decide(R, spec, plain, notes, "spec vs plain decode") else plain
     slots = None
-    if inv.get("experts") and "hybrid" in use["args"] and not a.no_slots:
+    if "--moe-cache-size" in use["args"]:  # 2026-11-14: the squeeze ladder already cut the slots to load; the sweep's 5000 ref failed
+        notes.append("slot sweep skipped: the squeeze ladder fixed the slot count (" + use["args"][use["args"].index("--moe-cache-size") + 1] + ")")
+    elif inv.get("experts") and "hybrid" in use["args"] and not a.no_slots:
         # 2026-11-13: a model with at most 5000 experts can't run the sweep (5000 and up exceed its pools), so it gets auto too
         few = int(inv.get("layers") or 0) * int(inv.get("experts") or 0) <= 5000
         if getattr(a, "slots_mode", "sweep") == "auto" or few:  # 2026-11-12: one --moe-cache-auto run instead of the sweep
@@ -1032,19 +1035,25 @@ def advice(res: dict) -> list[str]:
     log, notes, floor = res.get("log") or [], res.get("notes") or [], res.get("floor")
     fails = [r for r in log if not r.get("ok")]
     errs = [str(r.get("error")) for r in fails]
+    # what the card's launch line already has: a tip naming one of those is left out, and a failure the fit got past is
+    # worded as worked around
+    have = set((res.get("confirm") or {}).get("args") or (res.get("use") or res.get("best") or {}).get("args") or [])
+    loaded = res.get("best") is not None
+    head = lambda what: f"**{'Worked around' if loaded else 'Failed'}: {what}**"
+    tips = lambda opts: ", ".join(t for flag, t in opts if flag not in have) or "nothing left in this list"
     if res.get("best") is None:
         out.append("**Failed: nothing loaded.** " + (f"Last error: {err(fails[-1])[:300]}" if fails else "No run finished (run budget?)."))
     if any("available RAM" in e for e in errs):
-        out.append("**Failed: host RAM ran low** (the guard stopped a run). Try: close other apps, turn off vision (`--mm-disable vision`), "
-                   "or `--max-running-requests 1`.")
+        out.append(head("host RAM ran low") + " (the guard stopped a run). Try: " + tips([("", "close other apps"),
+                   ("--mm-disable", "turn off vision (`--mm-disable vision`)"), ("--max-running-requests", "`--max-running-requests 1`")]) + ".")
     if any(r.get("kv_short") for r in fails):
-        out.append("**Failed: not enough VRAM for the KV cache** on some loads. Try: "
-                   + ("fewer expert slots (`--moe-cache-size 3000`), " if res["inv"].get("experts") else "`--embed-weights host`, a smaller quant, ")
-                   +
-                   "`--max-running-requests 1`, `--cache-type naive`, or 8-bit KV (lossy).")
+        moe = res["inv"].get("experts")
+        out.append(head("not enough VRAM for the KV cache") + " on some loads. Try: " + tips(
+            ([("--moe-cache-size", "fewer expert slots (`--moe-cache-size 3000`)")] if moe else [("--embed-weights", "`--embed-weights host`"), ("", "a smaller quant")])
+            + [("--max-running-requests", "`--max-running-requests 1`"), ("--cache-type", "`--cache-type naive`"), ("--kv-cache-dtype", "8-bit KV (lossy)")]) + ".")
     logs = [m[1] for e in errs for m in [re.search(r"exited \(15\).*?see (\S+)", e)] if m]
     if logs:
-        out.append(f"**Failed: the server died during load** on {len(logs)} run(s) (exit 15). First log: `{logs[0]}`")
+        out.append(head("the server died during load") + f" on {len(logs)} run(s) (exit 15). First log: `{logs[0]}`")
     spec_fail = [n for n in notes if re.match(r"(MTP|DFlash) k=\d+ failed", n)]
     if spec_fail and not res.get("spec"):
         out.append(f"**Turned off: spec decoding** ({spec_fail[0][:200]}). The card uses plain decode.")
@@ -1068,8 +1077,9 @@ def advice(res: dict) -> list[str]:
             tries.append(f"the 8-bit KV rescue line below ({k8.get('ctx')} tokens, lossy)")
         elif k8.get("ok"):
             tries.append("8-bit KV gave no real gain here")
-        tries += ["fewer expert slots (MoE)" if res["inv"].get("experts") else "`--embed-weights host`",
-                  "`--max-running-requests 1`", f"or a lower floor (`--ctx-floor`, now {floor})"]
+        more = tips([("--moe-cache-size", "fewer expert slots") if res["inv"].get("experts") else ("--embed-weights", "`--embed-weights host`"),
+                     ("--max-running-requests", "`--max-running-requests 1`")])
+        tries += ([more] if more != "nothing left in this list" else []) + [f"or a lower floor (`--ctx-floor`, now {floor})"]
         out.append(f"**Failed: context floor.** {cm.get('ctx')} of {floor} tokens fit. Try: " + ", ".join(tries) + ".")
     return out
 
