@@ -9,7 +9,8 @@ lists and says what changed since the last run:
   upstream the same file on llama.cpp master (one public GET to raw.githubusercontent.com; --offline skips it)
 
 The watch list is the part to read: architectures upstream or bundled that the engine cannot load, with a version past the newest
-it runs in that family (lfm2moe runs, so an lfm3 lands there; gemma3 does not, gemma4 runs). New tensor types upstream are listed too: a quant made with one will not load until
+it runs in that family (lfm2moe runs, so an lfm3 lands there; gemma3 does not, gemma4 runs), or any name new on master
+in a family it runs (a family with no version number, like gpt-oss, counts only those). New tensor types upstream are listed too: a quant made with one will not load until
 the bundled table and a kernel have it. ft-fit's pre-flight stops on both at load time; this says it weeks earlier.
 
   py scripts/ft-arch-watch.py            # report, remember what was seen (speedprobe/arch-watch.json)
@@ -127,12 +128,12 @@ def main():
         print(f"engine loads {len(eng)} GGUF architectures; bundled gguf: {pin}")
         print(f"bundled knows {len(bun)} architectures, {len(btypes)} tensor types" +
               (f"; llama.cpp master knows {len(up)} and {len(utypes)}" if up is not None else ""))
-        print(f"\n1. Watch list ({len(watch)}): in llama.cpp, not loadable here, a newer version than the engine runs in its family")
+        print(f"\n1. Watch list ({len(watch)}): not loadable here, in a family the engine runs, and newer than its newest there or new on master")
         for x in watch:
             print(f"   - {x}" + ("  (upstream only: newer than the bundled pin)" if up is not None and x not in bun else ""))
         print(f"   (also not loadable, older or side variants of families it runs: {len(others)})")
         if up is not None:
-            print(f"\n2. On llama.cpp master, not in the bundled pin ({len(up_new)}): {', '.join(up_new) or 'none'}")
+            print(f"\n2. On llama.cpp master, not in the bundled pin ({len(up_new)}): " + (', '.join(x + (' (engine loads it)' if x in eng else '') for x in up_new) or 'none'))
             print(f"3. Tensor types on master the bundled table lacks ({len(types_new)}): "
                   + (", ".join(f"{v} ({k})" for k, v in types_new.items()) or "none") + ("  -> a quant using one cannot load here yet" if types_new else ""))
             if seen.get("upstream_archs"):
