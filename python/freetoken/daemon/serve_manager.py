@@ -127,9 +127,12 @@ def build_serve_command(
     daemon's own interpreter/venv with no PATH dependency."""
     # ROCm/gfx1201 fork: graphs default to batch 1 since 2026-11-05 (kernel spin-wait handshake makes hybrid decode graph-safe).
     # FT_GRAPH_MAX_BS=0 turns them off, 2 or 4 steps up. Placed before *args so an explicit flag from the app still wins.
-    graph_bs = os.environ.get("FT_GRAPH_MAX_BS", "1")
+    # 2026-11-14: default "auto" passes no flag, so the engine sets graph bs = --max-running-requests (upstream). Measured on
+    # ornith35 and qwen38-35b-distill: 4 requests at once 246/223 tok/s total with graphs at 4 vs 59/57 at graph bs 1, same KV.
+    # Undo: default back to "1".
+    graph_bs = os.environ.get("FT_GRAPH_MAX_BS", "auto")
     argv = [python, "-m", "freetoken.cli", "serve", "--model", model, "--port", str(port),
-            "--cuda-graph-max-bs", graph_bs, *args]
+            *([] if graph_bs.lower() == "auto" else ["--cuda-graph-max-bs", graph_bs]), *args]
     # Diagnostic 2026-11-03: FT_EXTRA_SERVE_ARGS (space-separated) goes last, so it overrides the app's flags
     argv += os.environ.get("FT_EXTRA_SERVE_ARGS", "").split()
     log_path = os.path.join(log_dir, f"serve-{port}.log")

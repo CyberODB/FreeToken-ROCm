@@ -73,6 +73,33 @@ def make_prompt(n_tokens, seed):
     return "".join(out) + "\n\nIn about 200 words, describe what kind of document the notes above could be."
 
 
+def count_tokens(port, prompt):
+    """The prompt's real token count from the server (/v1/messages/count_tokens, same tokenizer + chat template as a
+    generation), or None when the server can't say."""
+    body = {"model": "probe", "messages": [{"role": "user", "content": prompt}]}
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/messages/count_tokens", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return int(json.load(r)["input_tokens"])
+    except Exception:
+        return None
+
+
+def fit_prompt(port, n):
+    """make_prompt(n) counts ~1 token per word, which is tokenizer-dependent: LFM2's tokenizer gives ~1.39x, so a "p60k"
+    was 83K tokens and overflowed a 64K context (2026-11-13). Count it on the server, rescale once, recount."""
+    seed, ask = random.randrange(1 << 30), n
+    p = make_prompt(ask, seed)
+    for _ in range(3):
+        got = count_tokens(port, p)
+        if not got or abs(got - n) <= max(64, n // 100):
+            break
+        ask = max(1, round(ask * n / got))
+        p = make_prompt(ask, seed)
+    return p
+
+
 def chat(port, prompt, max_tokens, timeout=900):
     body = {"model": "probe", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
             "temperature": 0, "stream": True, "stream_options": {"include_usage": True},
@@ -190,13 +217,22 @@ def gguf_expert_upper(path):
 def base_args_for(model, extra):
     """BASE_ARGS, except (2026-11-12) when the model has fewer experts than the fixed 5000 slots: the engine then refuses to
     start ("MoE cache of 5000 slots exceeds what the pools can hold"), e.g. LFM2-24B-A2B with 38 x 64 = 2432 experts. Such a
-    model gets --moe-cache-auto, which sizes the slots to the card. A caller's own --moe-cache-size/--moe-cache-auto wins."""
+    model gets --moe-cache-auto, which sizes the slots to the card. A caller's own --moe-cache-size/--moe-cache-auto wins.
+    2026-11-13: --moe-strategy fused gets none: the engine refuses --moe-cpu-layers with fused, so every ft-fit stage after a
+    fused winner (spec, flags, confirm, context ladder) died at load."""
+    if "--moe-strategy=fused" in extra or any(a == "--moe-strategy" and b == "fused" for a, b in zip(extra, extra[1:])):
+        return []
     if any(x in extra for x in ("--moe-cache-size", "--moe-cache-auto", "--moe-cache-rate")):
         return ["--moe-cpu-layers", "auto"]
     cap = gguf_expert_upper(model)
     if cap is not None and cap <= int(BASE_ARGS[3]):
         print(f"model has at most {cap} experts, under the {BASE_ARGS[3]}-slot base: using --moe-cache-auto")
-        return ["--moe-cpu-layers", "auto", "--moe-cache-auto"]
+        # 2026-11-13: without a KV reserve, --moe-cache-auto keeps only its default 8192-token KV floor, so every context
+        # test past ~8K failed ("Input sequence length 8309 exceeds 8279"). Hold back the run's own context instead.
+        out = ["--moe-cpu-layers", "auto", "--moe-cache-auto"]
+        if "--kv-reserve-tokens" not in extra and "--max-seq-len-override" in extra[:-1]:
+            out += ["--kv-reserve-tokens", extra[extra.index("--max-seq-len-override") + 1]]
+        return out
     return BASE_ARGS
 
 
@@ -257,7 +293,7 @@ def main():
         for t in tests:  # pNk / pN: an N-thousand (or N) token prompt, then 256 tokens of decode at that depth
             m = re.fullmatch(r"p(\d+)(k?)", t)
             if m:
-                plan[t] = [(make_prompt(int(m[1]) * (1000 if m[2] else 1), random.randrange(1 << 30)), 256, "run")]
+                plan[t] = [(int(m[1]) * (1000 if m[2] else 1), 256, "run")]  # token target; fit_prompt builds it once the server is up
         conc = {t: int(m[1]) for t in tests if (m := re.fullmatch(r"c(\d+)", t)) and int(m[1]) >= 2}
         if bad := [t for t in tests if t not in plan and t not in conc]:
             sys.exit(f"unknown tests: {bad}")
@@ -275,6 +311,8 @@ def main():
                 continue
             for prompt, mt, kind in plan[t]:
                 _, pos = log_tail(logp, pos)
+                if isinstance(prompt, int):
+                    prompt = fit_prompt(a.port, prompt)
                 print(f"  [{i}/{len(tests)}] {t} {kind} ...", end="", flush=True)
                 r = chat(a.port, prompt, mt)
                 text, pos = log_tail(logp, pos)

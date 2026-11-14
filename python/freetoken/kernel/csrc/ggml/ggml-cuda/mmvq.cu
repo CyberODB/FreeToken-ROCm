@@ -320,6 +320,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+#ifdef FT_P4_MMQ_MIN_M
+    // FreeToken phase 4 experiment: MMQ from this many columns up (MTP verify is 2-4)
+    if (ne11 >= FT_P4_MMQ_MIN_M) {
+        return false;
+    }
+#endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
@@ -503,6 +509,27 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 1;
             }
         }
+#ifdef FT_P4_MMVQ_NW
+        // FreeToken phase 4 experiment: more warps for the 2-4 row (MTP verify) GEMVs
+        if (ncols_dst <= 4) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return FT_P4_MMVQ_NW;
+                default:
+                    return 1;
+            }
+        }
+#endif
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {

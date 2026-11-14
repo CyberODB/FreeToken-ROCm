@@ -114,6 +114,39 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
+_desktop_reserve: int | None = None
+
+
+def _desktop_reserve_bytes() -> int:
+    """ROCm fork 2026-11-11: VRAM held back for other programs (FREETOKEN_DESKTOP_RESERVE_GB, default 0 = off).
+
+    On Windows the driver reports nearly the whole card as free even when the desktop holds 2 GiB, so a full plan spills
+    into shared GPU memory and decode halves. A number is GiB; ``auto`` reads the adapter's dedicated usage once, at the
+    first free-memory read (before the weights load), and adds 0.5 GiB."""
+    global _desktop_reserve
+    if _desktop_reserve is not None:
+        return _desktop_reserve
+    v = os.environ.get("FREETOKEN_DESKTOP_RESERVE_GB", "").strip().lower()
+    gib = 0.0
+    if v == "auto":
+        try:
+            import subprocess
+
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "((Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage').CounterSamples | Measure-Object CookedValue -Maximum).Maximum"],
+                capture_output=True, text=True, timeout=30).stdout.strip()
+            gib = float(out) / 2**30 + 0.5
+        except Exception as exc:  # no counter: reserve nothing rather than fail the load
+            logger.warning(f"FREETOKEN_DESKTOP_RESERVE_GB=auto: could not read adapter memory ({exc}); reserving 0")
+    elif v:
+        gib = float(v)
+    _desktop_reserve = max(0, int(gib * 2**30))
+    if _desktop_reserve:
+        logger.info_rank0(f"Desktop VRAM reserve: {gib:.2f} GiB held back from every free-memory read (FREETOKEN_DESKTOP_RESERVE_GB={v})")
+    return _desktop_reserve
+
+
 def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
     what the resident model consumed. Kept as a pure function so the composition with the
@@ -1196,7 +1229,7 @@ class Engine:
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
-        free_memory = get_free_memory(self.device)
+        free_memory = max(0, get_free_memory(self.device) - _desktop_reserve_bytes())
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group

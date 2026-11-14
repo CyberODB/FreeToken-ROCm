@@ -1,0 +1,236 @@
+{
+ "class": "qwen35-dense",
+ "model": "E:\\ai-hot\\qwen38-27b_4.2bpw.gguf",
+ "when": "2026-11-14 06:30",
+ "plain_args": [
+  "--memory-ratio",
+  "0.90",
+  "--max-running-requests",
+  "1"
+ ],
+ "plain_tps": 33.66,
+ "flags": [
+  {
+   "id": "cpu-threads-6",
+   "kind": "arg",
+   "name": "--moe-cpu-threads",
+   "value": "--moe-cpu-threads 6",
+   "lossless": true,
+   "status": "safe",
+   "note": "doc 18 phase 1: coordinator and spin threads share 8 cores",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "cpu-threads-8",
+   "kind": "arg",
+   "name": "--moe-cpu-threads",
+   "value": "--moe-cpu-threads 8",
+   "lossless": true,
+   "status": "safe",
+   "note": "doc 18 phase 1",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "fused-combine",
+   "kind": "env",
+   "name": "FT_P4_FUSED_COMBINE",
+   "value": "1",
+   "lossless": "unknown",
+   "status": "candidate",
+   "note": "bit-exact standalone, checked on Groot only (doc 18); not committed",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "hybrid-max-fetch",
+   "kind": "arg",
+   "name": "--moe-hybrid-max-fetch",
+   "lossless": true,
+   "status": "safe",
+   "values": [
+    "--moe-hybrid-max-fetch 0",
+    "--moe-hybrid-max-fetch 2",
+    "--moe-hybrid-max-fetch 4"
+   ],
+   "note": "2026-11-12: fixed caps against auto (-1, from the ft bench bw profile; 0 = every miss on the CPU). Values are a first pick, not from the code.",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "locked-max-fetch",
+   "kind": "arg",
+   "name": "--moe-locked-max-fetch",
+   "lossless": true,
+   "status": "safe",
+   "values": [
+    "--moe-locked-max-fetch 4",
+    "--moe-locked-max-fetch 16"
+   ],
+   "note": "2026-11-12: default 8; applies only to layers left locked by --moe-cpu-layers auto; costs pinned staging per bank",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "prefill-chunk",
+   "kind": "arg",
+   "name": "--max-prefill-length",
+   "lossless": true,
+   "status": "safe",
+   "values": [
+    "--max-prefill-length 2048",
+    "--max-prefill-length 4096"
+   ],
+   "tests": "decode,p5k",
+   "metric": "prefill:p5k",
+   "note": "2026-11-12: default chunk is 8192 (scheduler config); judged on 5K-prompt prefill speed",
+   "value": "--max-prefill-length 2048",
+   "result": "`--max-prefill-length 2048`: decode 33.65 tok/s, p5k 33.05 tok/s; minRAM 2.07 GiB, maxVRAM 15.69 GiB; prefill:p5k 362.4 vs 193.5; text identical | `--max-prefill-length 4096`: decode 33.67 tok/s, p5k 33.06 tok/s; minRAM 1.72 GiB, maxVRAM 15.69 GiB; prefill:p5k 229.6 vs 193.5; text identical | second run | `--max-prefill-length 2048`: decode 33.76 tok/s, p5k 33.28 tok/s; minRAM 2.18 GiB, maxVRAM 15.69 GiB; prefill:p5k 357.2 vs 193.5; text identical",
+   "keep": true,
+   "metric_value": 359.8,
+   "ref_value": 193.5,
+   "variants": [
+    {
+     "label": "dense-r90-mr1-prefillchunk-2048",
+     "value": "--max-prefill-length 2048",
+     "ok": true,
+     "metric": 359.8,
+     "ref": 193.5,
+     "text_same": true,
+     "worse": [],
+     "pass": true
+    },
+    {
+     "label": "dense-r90-mr1-prefillchunk-4096",
+     "value": "--max-prefill-length 4096",
+     "ok": true,
+     "metric": 229.6,
+     "ref": 193.5,
+     "text_same": true,
+     "worse": [],
+     "pass": true
+    }
+   ]
+  },
+  {
+   "id": "cache-scope-per-layer",
+   "kind": "arg",
+   "name": "--moe-cache-scope",
+   "value": "--moe-cache-scope per-layer",
+   "lossless": true,
+   "status": "safe",
+   "tests": "decode,p5k",
+   "note": "2026-11-12: one slot pool per layer (equal split) against the unified pool",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "prefill-hit-d2d",
+   "kind": "arg",
+   "name": "--moe-prefill-hit-d2d",
+   "value": "--moe-prefill-hit-d2d",
+   "lossless": true,
+   "status": "candidate",
+   "tests": "decode,p5k",
+   "metric": "prefill:p5k",
+   "note": "2026-11-12: not run: with --moe-cpu-layers auto and locked layers the engine forces prefill overlap off, so this does nothing (engine.py:1035). Try only on a model with no locked layers; the log says 'hit-D2D requested but unavailable' if HIP batch copy fails.",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "prefill-no-overlap",
+   "kind": "arg",
+   "name": "--disable-moe-prefill-overlap",
+   "value": "--disable-moe-prefill-overlap",
+   "lossless": true,
+   "status": "candidate",
+   "tests": "decode,p5k",
+   "metric": "prefill:p5k",
+   "note": "2026-11-12: not run: overlap is already off under split residency (see prefill-hit-d2d)",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "cache-split-profile",
+   "kind": "arg",
+   "name": "--moe-cache-split",
+   "value": "",
+   "lossless": true,
+   "status": "candidate",
+   "note": "2026-11-12: needs --moe-cache-scope per-layer and a profile file {model, expert_counts[L][E]}; no tool writes one yet (FT_EXPERT_FREQ's decode matrix could be wrapped). Expert skew measured weak on the 35B, so low priority.",
+   "result": "not run (MoE-only flag; dense model)"
+  },
+  {
+   "id": "kv-cache-fp8",
+   "kind": "arg",
+   "name": "--kv-cache-dtype",
+   "value": "--kv-cache-dtype fp8_per_token_head",
+   "lossless": false,
+   "status": "candidate",
+   "note": "2026-11-13 (upstream #894): 8-bit KV, about half the KV memory, so more context per GB. Lossy, so never auto-kept. Needs --dtype bfloat16; never loaded on ROCm. int8_per_token_head is the other format.",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "spec-token-map",
+   "kind": "arg",
+   "name": "--speculative-token-map",
+   "value": "",
+   "lossless": true,
+   "status": "candidate",
+   "note": "2026-11-13 (upstream #892): MTP draft scores only the ids in a map file; target still verifies the whole vocabulary. Needs a file from scripts/make_token_map.py MODEL (tokenizer only) and belongs in the spec stage (MTP on), not here.",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "online-quant-df11",
+   "kind": "arg",
+   "name": "--online-quant",
+   "value": "--online-quant df11",
+   "lossless": true,
+   "status": "candidate",
+   "note": "2026-11-13 (upstream #891): lossless ~11 bit packing of bf16 layers only, about 30% less VRAM for those, a decode per use. A GGUF-quantized model like the 35B IQ4_NL has few or no bf16 Linear layers, so probably refused there.",
+   "result": "not run (candidate)"
+  }
+ ],
+ "parallel": {
+  "rows": [
+   {
+    "n": 2,
+    "graph_bs": 2,
+    "extra": null,
+    "ok": true,
+    "total_tps": 60.11,
+    "per_req_tps": [
+     30.01,
+     30.0
+    ],
+    "single_tps": 33.79,
+    "kv_tokens": 9053,
+    "max_vram_gib": 15.68,
+    "min_ram_gib": 2.37,
+    "error": null
+   },
+   {
+    "n": 4,
+    "graph_bs": 4,
+    "extra": null,
+    "ok": false,
+    "total_tps": null,
+    "per_req_tps": null,
+    "single_tps": null,
+    "kv_tokens": null,
+    "max_vram_gib": 12.37,
+    "min_ram_gib": 3.54,
+    "error": "server exited (15) during load; see E:\\freetoken-021\\speedprobe\\fit-qwen38-27b-4-2bpw-dense-r90-mr1-par4.log"
+   },
+   {
+    "n": 4,
+    "graph_bs": 1,
+    "extra": null,
+    "ok": false,
+    "total_tps": null,
+    "per_req_tps": null,
+    "single_tps": null,
+    "kv_tokens": null,
+    "max_vram_gib": 12.52,
+    "min_ram_gib": 3.86,
+    "error": "server exited (15) during load; see E:\\freetoken-021\\speedprobe\\fit-qwen38-27b-4-2bpw-dense-r90-mr1-par4-g1.log"
+   }
+  ],
+  "best_n": 2,
+  "plain_tps": 33.66,
+  "extra": null
+ }
+}

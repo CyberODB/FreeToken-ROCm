@@ -101,6 +101,18 @@ _timer = _PhaseTimer(_HYBRID_TIMING) if _HYBRID_TIMING > 0 else None
 from freetoken.kernel.graph_stamps import stamp as _gstamp  # noqa: E402  (no-op unless FREETOKEN_GRAPH_STAMPS)
 
 
+def _debug_sync_prefill(stage: str, layer_id: int) -> None:
+    """FT_DEBUG_PREFILL_SYNC=1 (diagnostic, 2026-11-06): the same per-stage sync for prefill MoE, to find
+    which kernel faults on long prompts. Separate from FT_DEBUG_GLU, whose decode syncs break graph capture."""
+    if os.environ.get("FT_DEBUG_PREFILL_SYNC"):
+        global _DEBUG_SYNC
+        on, _DEBUG_SYNC = _DEBUG_SYNC, True
+        try:
+            _debug_sync(stage, layer_id)
+        finally:
+            _DEBUG_SYNC = on
+
+
 def _debug_sync(stage: str, layer_id: int) -> None:
     global _debug_sync_left
     if not _DEBUG_SYNC or _debug_sync_left <= 0 or torch.cuda.is_current_stream_capturing():
@@ -334,12 +346,14 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
+        _debug_sync_prefill(f"prefill_start(attn+router done) n={hidden_states.shape[0]}", self.layer_id)
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        _debug_sync_prefill("prefill_after_fused_topk", self.layer_id)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
@@ -502,6 +516,8 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.collect_decode_freq and cache.expert_freq_path:
+            cache.count_prefill_routes(self.layer_id, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -517,7 +533,9 @@ class OffloadMoELayer(MoELayer):
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
+        _debug_sync_prefill("prefill_after_materialize", self.layer_id)
         cache.copy_missing()
+        _debug_sync_prefill("prefill_after_copy_missing", self.layer_id)
         out = self._expert_gemm(
             cache,
             hidden_states,
@@ -528,6 +546,7 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        _debug_sync_prefill("prefill_after_expert_gemm", self.layer_id)
         cache.release_prefill_layer(self.layer_id)
         return out
 

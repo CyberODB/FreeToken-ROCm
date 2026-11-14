@@ -298,10 +298,16 @@ class OffloadMoeCache:
         # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
         # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
         # captured graph would not re-run this host-side scatter on replay).
-        self.collect_decode_freq = False
+        # FT_EXPERT_FREQ=<json path> (2026-11-11, measurement only): count decode routing here and prefill routing in
+        # layers/moe.py::_prefill_routed; dumped at the start of every prefill (dump_expert_freq). Undo: unset the env.
+        self.expert_freq_path = os.environ.get("FT_EXPERT_FREQ", "").strip()
+        self.collect_decode_freq = bool(self.expert_freq_path)
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        self.prefill_freq = torch.zeros_like(self.decode_freq)
+        self.prefill_distinct = torch.zeros((self.num_layers, 2), dtype=torch.int64, device=self.device)  # [sum distinct, calls]
+        self.prefill_tokens = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # the pool and staging views) iterates this list, so the slot cache is bank-count agnostic.
@@ -1110,6 +1116,31 @@ class OffloadMoeCache:
             (max_fetch, fraction), cap = self.locked_fetch.plan[layer_id], self.locked_fetch.max_fetch
         self._pending_fetch_cap = cap
         return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
+
+    def count_prefill_routes(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """FT_EXPERT_FREQ: prefill routing histogram plus distinct experts per prefill call (measurement only)."""
+        if layer_id == 0:
+            self.dump_expert_freq()
+            self.prefill_tokens += int(expert_ids.reshape(-1, expert_ids.shape[-1]).shape[0])
+        ids = expert_ids.reshape(-1).long()
+        self.prefill_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        self.prefill_distinct[layer_id, 0] += torch.unique(ids).numel()
+        self.prefill_distinct[layer_id, 1] += 1
+
+    def dump_expert_freq(self) -> None:
+        import json
+        try:
+            data = {
+                "decode": self.decode_freq.cpu().tolist(), "prefill": self.prefill_freq.cpu().tolist(),
+                "prefill_distinct": self.prefill_distinct.cpu().tolist(), "prefill_tokens": self.prefill_tokens,
+                "resident": None,
+            }
+            tmp = self.expert_freq_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.expert_freq_path)
+        except Exception as e:  # never break serving for a measurement
+            logger.warning_rank0(f"FT_EXPERT_FREQ dump failed: {e}")
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer

@@ -226,6 +226,9 @@ class HostBank:
         Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
         if self._locked or self._pinned or self._mapped:  # cudaHostRegister already page-locks; a mapped bank stays evictable
             return
+        # ROCm fork 2026-11-11: FREETOKEN_SKIP_BANK_LOCK=1 leaves locked-layer banks pageable so the OS can reclaim them under pressure (opt-in, test switch)
+        if os.environ.get("FREETOKEN_SKIP_BANK_LOCK", "").strip().lower() in ("1", "true", "yes", "on"):
+            return
         global _os_lock_failed
         if _os_lock_failed:
             return  # the quota is exhausted for good; skip the syscall spam

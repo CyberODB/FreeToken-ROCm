@@ -16,6 +16,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 from freetoken.utils import nvtx_annotate
+from freetoken.kernel.graph_stamps import fine as _fine
 
 from .attention import Qwen3_5Attention
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
@@ -65,9 +66,14 @@ class Qwen3_5DecoderLayer(BaseOP):
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
         # Residual-stream form: fuse each residual-add into the next RMSNorm so add + norm are one kernel per sublayer.
+        lid = self._layer_id
+        _fine("prev MoE combine (routed+shared)", lid)
         hidden, residual = self.input_layernorm.forward(hidden, residual)
+        _fine("norm in", lid)
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        _fine("GDN out_proj" if self._is_linear else "full attention", lid)
         hidden, residual = self.post_attention_layernorm.forward(hidden, residual)
+        _fine("norm post", lid)
         hidden = self.mlp.forward(hidden)
         return hidden, residual
 

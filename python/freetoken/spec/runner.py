@@ -122,6 +122,11 @@ class SpecRunner:
             )
         else:
             out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+        from freetoken.kernel import graph_stamps
+
+        stamps = graph_stamps.get()
+        if stamps is not None and engine.graph_runner.can_use_cuda_graph(batch):
+            stamps.after_sample()  # one verify step = one stamp step; the draft graph lands in its own (layer 40+) slots
         host = self._host[:bs]
         host.copy_(torch.cat([out, emitted.unsqueeze(1)], dim=1), non_blocking=True)
         copy_done = torch.cuda.Event()

@@ -223,7 +223,15 @@ void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Opt
     const cudaStream_t stream = ctx.stream();
     const int cc = device_cc();
     ggml_cuda_pool_alloc<float> x32(ctx.pool());
-    if (ggml_cuda_should_use_mmvq(type, cc, m)) {
+    bool use_mmvq = ggml_cuda_should_use_mmvq(type, cc, m);
+#ifdef FT_P4_MMQ_MIN_N
+    // FreeToken phase 4 experiment: 2-8 row GEMMs over wide weights (head, GDN in_proj) go to MMQ;
+    // their tails already pass the MMQ check, since prefill runs MMQ on the same weights
+    if (m >= 2 && n >= FT_P4_MMQ_MIN_N) {
+        use_mmvq = false;
+    }
+#endif
+    if (use_mmvq) {
         const Activation a = activation(x, true, x32, stream);
         ggml_tensor src1 = describe(a.type, a.data, {k, m, 1, 1}, {a.esz, a.esz * k, a.esz * k * m, a.esz * k * m});
         const void * q8 = nullptr;

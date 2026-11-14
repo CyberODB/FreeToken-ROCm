@@ -9,11 +9,11 @@ Stages: 1 inventory/size check, 2 upgrades (MTP), 3 strategy, 4 memory ratio, 4s
 2026-11-12 (undo: ft-fit.py.bak-20261112-stages):
   4s  --slots-mode auto: one --moe-cache-auto run (KV floor --kv-reserve) instead of the sweep; the engine's slot count
       is read from its log and becomes the card's cache.
-  5   --dflash-head <path>: a DFlash draft is tried after MTP (k 2-4); the faster of the two is the spec config.
+  5   --dflash-head <path>: a DFlash draft is tried after MTP (k 3/5/7/11/15 up to block_size-1, 2026-11-13); the faster of the two is the spec config.
   6   a fit-flags.json entry may carry "values" (one run each), "tests", "metric" (decode | prefill:<test> | total:<test>)
       and "lossless"; kept only when lossless is true, the text is identical, the metric gains over 2% and nothing else
       in the run is over 5% worse. A tests string other than "decode" gets its own plain reference run.
-  6p  parallel requests (2 and 4 at once, test cN): report only, never changes the winner; --no-parallel skips it.
+  6p  parallel requests (2, 4, 8 at once with graphs at N; 4 at graph bs 1 = live today; FT_FIT_PAR_EXTRA adds the args to 2 and 4; test cN): report only, never changes the winner; --no-parallel skips it.
 2026-11-13 flow rework (undo: ft-fit.py.bak-20261113-flow). The order is now:
   3+4 strategy/ratio -> 5 spec (MTP, DFlash, then --token-map on the MTP winner) -> 6 slots on the config in use, against
   --ctx-floor (fastest count that holds it) -> 7 final: the launch line as stamped, in one run, with the class's tune flags
@@ -54,7 +54,7 @@ SAME = 0.02  # gains under 2% are noise (doc 18: +-1-2 tok/s per 512-token run)
 SLOTS = (4000, 3000, 2000)
 SLOT_DECODE, SLOT_PREFILL = 0.05, 0.10
 FLAG_WORSE = 0.05  # 2026-11-12 stage 6: a flag is not kept when another number of its run drops more than this
-PARALLEL = (2, 4)  # 2026-11-12 stage 6p: requests at once
+PARALLEL = (2, 4, 8)  # 2026-11-12 stage 6p: requests at once (8 added 2026-11-14)
 # 2026-11-13 flow rework (undo: ft-fit.py.bak-20261113-flow)
 SLOTS_UP = (6500, 8000)  # tried only when 5000 slots already hold the context floor: more experts on the GPU for speed
 TUNE_DIR = os.path.join(PROBE_OUT, "tune")  # <class>.json: the flags and parallel report of a --tune run
@@ -119,7 +119,11 @@ def inventory(model: str, vram_gib: float, desktop_gib: float, extra_gib: float)
     # KV per token (bf16 assumed): only full-attention layers hold KV in qwen35*/hybrid archs
     layers, kvh, kl, vl = g("block_count"), g("attention.head_count_kv"), g("attention.key_length"), g("attention.value_length")
     kv_tok = None
-    if layers and kvh and kl and vl and not isinstance(kvh, (list, tuple)):
+    if not (kl and vl) and g("embedding_length") and g("attention.head_count"):  # LFM2 has no key_length: embedding / heads
+        kl = vl = int(g("embedding_length")) // int(g("attention.head_count"))
+    if layers and kvh and kl and vl and isinstance(kvh, (list, tuple)):  # 2026-11-13: per-layer list (LFM2: 0 on conv layers)
+        kv_tok = sum(int(h) for h in kvh) * (int(kl) + int(vl)) * 2
+    elif layers and kvh and kl and vl:
         attn_layers = int(layers) // int(g("full_attention_interval", 1) or 1)
         kv_tok = attn_layers * int(kvh) * (int(kl) + int(vl)) * 2
     mmproj = find_mmproj(model)
@@ -409,9 +413,20 @@ def ladder(inv: dict, a) -> dict:
     # stage 5: spec decoding. MTP first; 2026-11-12: then a DFlash draft when --dflash-head names one. The faster is `spec`.
     spec = None
 
-    def spec_try(kind: str, extra: list[str]) -> dict | None:
+    def dflash_ks(head: str) -> tuple[int, ...]:
+        # 2026-11-13: DFlash drafts a whole block; k 2-4 left most of it unused (11/7 run: DFlash k3 107 vs MTP k3 128 tok/s).
+        # Try up to block_size - 1 (the engine's cap). Undo: ft-fit.py.bak-20261113-dflashk
+        try:
+            with open(os.path.join(head, "config.json"), encoding="utf-8") as f:
+                c = json.load(f)
+            b = int((c.get("dflash_config") or {}).get("block_size") or c.get("block_size") or 8)
+        except (OSError, ValueError):
+            b = 8
+        return tuple(k for k in (3, 5, 7, 11, 15) if k <= b - 1)
+
+    def spec_try(kind: str, extra: list[str], ks: tuple[int, ...] = (2, 3, 4)) -> dict | None:
         top = None
-        for k in (2, 3, 4):
+        for k in ks:
             r = R.run("5-spec", f"{plain['label']}-{kind}{k}", plain["args"] + ["--speculative-algorithm", kind, "--speculative-num-steps", str(k)] + extra)
             if r is None or not r["ok"]:
                 if r is not None:
@@ -419,7 +434,7 @@ def ladder(inv: dict, a) -> dict:
                 break
             if top is None or better(r, top):
                 top = r
-            elif tps(r) < tps(top):
+            elif tps(r) < tps(top) and kind == "mtp":  # DFlash speed is not monotone in k: run every rung
                 break
         return top
 
@@ -441,8 +456,10 @@ def ladder(inv: dict, a) -> dict:
     if dhead and not os.path.exists(dhead):
         notes.append(f"--dflash-head {dhead} does not exist; DFlash skipped")
     elif dhead:
-        R.max_runs += 3  # its own runs: the later stages keep their budget
-        dfl = spec_try("dflash", ["--speculative-draft-model-path", dhead])
+        dks = dflash_ks(dhead)
+        R.max_runs += len(dks)  # its own runs: the later stages keep their budget
+        notes.append(f"DFlash ladder k={list(dks)} (draft block size from its config.json)")
+        dfl = spec_try("dflash", ["--speculative-draft-model-path", dhead], dks)
         if dfl is not None and spec is not None:
             notes.append(f"spec decoding: MTP {tps(spec)} tok/s, DFlash {tps(dfl)} tok/s; {'DFlash' if better(dfl, spec) else 'MTP'} kept")
         if dfl is not None and (spec is None or better(dfl, spec)):
@@ -451,7 +468,9 @@ def ladder(inv: dict, a) -> dict:
     use = spec if spec and better(spec, plain) else plain
     slots = None
     if inv.get("experts") and "hybrid" in use["args"] and not a.no_slots:
-        if getattr(a, "slots_mode", "sweep") == "auto":  # 2026-11-12: one --moe-cache-auto run instead of the sweep
+        # 2026-11-13: a model with at most 5000 experts can't run the sweep (5000 and up exceed its pools), so it gets auto too
+        few = int(inv.get("layers") or 0) * int(inv.get("experts") or 0) <= 5000
+        if getattr(a, "slots_mode", "sweep") == "auto" or few:  # 2026-11-12: one --moe-cache-auto run instead of the sweep
             slots = slot_auto_stage(R, inv, use, notes, int(getattr(a, "kv_reserve", 0) or floor))
         else:
             slots = slot_stage(R, inv, use, notes, floor)
@@ -683,27 +702,37 @@ def parallel_stage(R: "Runner", plain: dict, notes: list[str]) -> dict:
     """Stage 6p (2026-11-12): N requests at once on the plain config, N in PARALLEL, stopping at the first N that fails. The probe's
     cN test gives the total tok/s over the N requests and each request's own. best_n is the N with the highest total when
     that beats one request's decode by more than SAME, else 1. It only reports: how much context each request gets is the user's call."""
-    out = {"rows": [], "best_n": 1, "plain_tps": tps(plain)}
-    R.max_runs += len(PARALLEL)
+    # 2026-11-14: rows are (requests, graph bs, extra args). The graph series stops at its first failure. Then one row at 4 requests
+    # with graph bs 1, which is what the live launchers run today (FT_GRAPH_MAX_BS=1), and with FT_FIT_PAR_EXTRA (e.g. the spec
+    # args) the 2 and 4 rows again with those args added. Only the plain graph series sets best_n.
+    extra = os.environ.get("FT_FIT_PAR_EXTRA", "").split()
+    series = [(n, n, []) for n in PARALLEL]
+    tail = [(4, 1, [])] + ([(2, 2, extra), (4, 4, extra)] if extra else [])
+    out = {"rows": [], "best_n": 1, "plain_tps": tps(plain), "extra": " ".join(extra) or None}
+    R.max_runs += len(series) + len(tail)
     base = list(plain["args"])
     while "--max-running-requests" in base:  # a dense winner may carry --max-running-requests 1
         i = base.index("--max-running-requests")
         del base[i:i + 2]
-    for n in PARALLEL:
+    failed = False
+    for n, g, x in series + tail:
+        if failed and g == n and not x:
+            continue  # the graph series already failed at a smaller N
         t = f"c{n}"
-        r = R.run("6p-parallel", f"{plain['label']}-par{n}", base + ["--max-running-requests", str(n), "--cuda-graph-max-bs", str(n)],
-                  tests=f"decode,{t}", env={"FT_GRAPH_MAX_BS": str(n)})
+        label = f"{plain['label']}-par{n}" + ("" if g == n else f"-g{g}") + ("-x" if x else "")
+        r = R.run("6p-parallel", label, base + x + ["--max-running-requests", str(n), "--cuda-graph-max-bs", str(g)],
+                  tests=f"decode,{t}", env={"FT_GRAPH_MAX_BS": str(g)})
         if r is None:
-            notes.append(f"parallel stage: {n} requests skipped, run budget spent")
+            notes.append(f"parallel stage: {label} skipped, run budget spent")
             break
         ok = bool(r.get("ok"))
-        out["rows"].append({"n": n, "ok": ok, "total_tps": (r.get("tps") or {}).get(t) if ok else None, "per_req_tps": (r.get("per_req") or {}).get(t),
-                            "single_tps": tps(r) if ok else None, "kv_tokens": r.get("kv_tokens"), "max_vram_gib": r.get("max_vram_gib"),
-                            "min_ram_gib": r.get("min_ram_gib"), "error": None if ok else str(r.get("error"))[:200]})
+        out["rows"].append({"n": n, "graph_bs": g, "extra": " ".join(x) or None, "ok": ok, "total_tps": (r.get("tps") or {}).get(t) if ok else None,
+                            "per_req_tps": (r.get("per_req") or {}).get(t), "single_tps": tps(r) if ok else None, "kv_tokens": r.get("kv_tokens"),
+                            "max_vram_gib": r.get("max_vram_gib"), "min_ram_gib": r.get("min_ram_gib"), "error": None if ok else str(r.get("error"))[:200]})
         if not ok:
-            notes.append(f"parallel stage: {n} requests at once failed: {err(r)}")
-            break
-    good = [x for x in out["rows"] if x["ok"] and x["total_tps"]]
+            notes.append(f"parallel stage: {label} failed: {err(r)}")
+            failed = failed or (g == n and not x)
+    good = [x for x in out["rows"] if x["ok"] and x["total_tps"] and x["graph_bs"] == x["n"] and not x["extra"]]
     if good:
         top = max(good, key=lambda x: x["total_tps"])
         if top["total_tps"] > tps(plain) * (1 + SAME):
@@ -733,7 +762,9 @@ def slot_auto_stage(R: "Runner", inv: dict, win: dict, notes: list[str], reserve
     elif not n:
         notes.append("auto slots: the run was fine but its log does not name the slot count the engine chose; kept 5000 slots")
     else:
-        out.update(pick=n, kv_tokens=r.get("kv_tokens"), row=dict(r, args=win["args"] + ["--moe-cache-size", str(n)]))
+        # 2026-11-13: the card keeps --moe-cache-auto + the reserve, not the slot count it resolved to: a fixed 2036 slots
+        # left LFM2 62603 KV tokens on the next load (free VRAM moves), under the 65536 floor the auto run held.
+        out.update(pick=n, kv_tokens=r.get("kv_tokens"), row=dict(r, args=win["args"] + ["--moe-cache-auto", "--kv-reserve-tokens", str(reserve)]))
     return out
 
 
@@ -905,7 +936,7 @@ def card(res: dict) -> str:
         keep_args = [x for f in res["flags"] if f.get("keep") and f["kind"] == "arg" for x in f["value"].split()]
         vis_ok = confirm is not None and confirm.get("ok") and confirm.get("vision")
         launch = win["args"] + keep_args + ([] if vis_ok or not inv["mmproj"] else ["--mm-disable", "vision"])
-        base = "" if "fused" in win["args"] else " --moe-cpu-layers auto" + ("" if "--moe-cache-size" in launch else " --moe-cache-size 5000")
+        base = "" if "fused" in win["args"] else " --moe-cpu-layers auto" + ("" if "--moe-cache-size" in launch or "--moe-cache-auto" in launch else " --moe-cache-size 5000")
         L += ["## Recommended launch", "", "```", f"ft serve --model-path \"{inv['model']}\"{base} {' '.join(launch)}", "```", ""]
         if res.get("reserve"):
             L += [f"Fitted with FREETOKEN_DESKTOP_RESERVE_GB={res['reserve']} on every run (VRAM held back for the desktop); serve with the same value.", ""]
@@ -965,8 +996,9 @@ def card(res: dict) -> str:
         L += ["", "## Parallel requests", "", f"One request decodes at {par['plain_tps']} tok/s. Best: **{par['best_n']} at once**"
               + ("" if par["best_n"] > 1 else " (more requests gave no more total speed)") + ". Not in the launch line: the context per request "
               "is your call. To use N: `--max-running-requests N --cuda-graph-max-bs N` and FT_GRAPH_MAX_BS=N.", "",
-              "| requests | total tok/s | per request tok/s | one request tok/s | KV tokens | max VRAM GiB | min RAM GiB |", "|---|---|---|---|---|---|---|"]
-        L += [f"| {x['n']} | {x['total_tps'] if x['ok'] else 'FAIL: ' + str(x['error'])[:80]} | {' '.join(str(v) for v in x['per_req_tps'] or [])} | {x['single_tps'] or ''} "
+              "| requests | graph bs | extra args | total tok/s | per request tok/s | one request tok/s | KV tokens | max VRAM GiB | min RAM GiB |",
+              "|---|---|---|---|---|---|---|---|---|"]
+        L += [f"| {x['n']} | {x.get('graph_bs', x['n'])} | {x.get('extra') or ''} | {x['total_tps'] if x['ok'] else 'FAIL: ' + str(x['error'])[:80]} | {' '.join(str(v) for v in x['per_req_tps'] or [])} | {x['single_tps'] or ''} "
               f"| {x['kv_tokens'] or ''} | {x['max_vram_gib'] or ''} | {x['min_ram_gib'] or ''} |" for x in par["rows"]]
     if res["notes"]:
         L += ["", "## Notes", ""] + [f"- {n}" for n in res["notes"]]
@@ -997,7 +1029,7 @@ def winner(res: dict) -> dict:
     vis_ok = bool(confirm and confirm.get("ok") and confirm.get("vision"))
     fused = "fused" in win["args"]
     a, plain, spec_args, head = list(win["args"]), [], [], None
-    i, picked = 0, 5000
+    i, picked = 0, (0 if "--moe-cache-auto" in a else 5000)  # auto + reserve (2026-11-13): no fixed count for the bench to add
     while i < len(a):  # split the spec args off
         if a[i] in SPEC:
             spec_args += a[i:i + 2]

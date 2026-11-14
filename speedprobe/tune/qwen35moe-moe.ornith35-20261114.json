@@ -1,0 +1,423 @@
+{
+ "class": "qwen35moe-moe",
+ "model": "E:\\ai-hot\\ornith35_apex-mtp-mini.gguf",
+ "when": "2026-11-14 06:05",
+ "plain_args": [
+  "--moe-strategy",
+  "hybrid",
+  "--memory-ratio",
+  "0.80"
+ ],
+ "plain_tps": 111.28,
+ "flags": [
+  {
+   "id": "cpu-threads-6",
+   "kind": "arg",
+   "name": "--moe-cpu-threads",
+   "value": "--moe-cpu-threads 6",
+   "lossless": true,
+   "status": "safe",
+   "note": "doc 18 phase 1: coordinator and spin threads share 8 cores",
+   "result": "decode 111.42 tok/s; minRAM 2.89 GiB, maxVRAM 14.64 GiB; text identical",
+   "keep": false,
+   "metric_value": 111.42,
+   "ref_value": 111.28,
+   "variants": [
+    {
+     "label": "hybrid-r80-cputhreads6",
+     "value": "--moe-cpu-threads 6",
+     "ok": true,
+     "metric": 111.42,
+     "ref": 111.28,
+     "text_same": true,
+     "worse": [],
+     "pass": false
+    }
+   ]
+  },
+  {
+   "id": "cpu-threads-8",
+   "kind": "arg",
+   "name": "--moe-cpu-threads",
+   "value": "--moe-cpu-threads 8",
+   "lossless": true,
+   "status": "safe",
+   "note": "doc 18 phase 1",
+   "result": "decode 108.56 tok/s; minRAM 2.78 GiB, maxVRAM 14.63 GiB; text identical",
+   "keep": false,
+   "metric_value": 108.56,
+   "ref_value": 111.28,
+   "variants": [
+    {
+     "label": "hybrid-r80-cputhreads8",
+     "value": "--moe-cpu-threads 8",
+     "ok": true,
+     "metric": 108.56,
+     "ref": 111.28,
+     "text_same": true,
+     "worse": [],
+     "pass": false
+    }
+   ]
+  },
+  {
+   "id": "fused-combine",
+   "kind": "env",
+   "name": "FT_P4_FUSED_COMBINE",
+   "value": "1",
+   "lossless": "unknown",
+   "status": "candidate",
+   "note": "bit-exact standalone, checked on Groot only (doc 18); not committed",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "hybrid-max-fetch",
+   "kind": "arg",
+   "name": "--moe-hybrid-max-fetch",
+   "lossless": true,
+   "status": "safe",
+   "values": [
+    "--moe-hybrid-max-fetch 0",
+    "--moe-hybrid-max-fetch 2",
+    "--moe-hybrid-max-fetch 4"
+   ],
+   "note": "2026-11-12: fixed caps against auto (-1, from the ft bench bw profile; 0 = every miss on the CPU). Values are a first pick, not from the code.",
+   "value": "--moe-hybrid-max-fetch 4",
+   "result": "`--moe-hybrid-max-fetch 0`: decode 40.33 tok/s; minRAM 2.97 GiB, maxVRAM 14.63 GiB; TEXT DIFFERS; worse: decode 40.33 vs 111.28 | `--moe-hybrid-max-fetch 2`: decode 102.96 tok/s; minRAM 2.84 GiB, maxVRAM 14.64 GiB; TEXT DIFFERS; worse: decode 102.96 vs 111.28 | `--moe-hybrid-max-fetch 4`: decode 105.51 tok/s; minRAM 2.74 GiB, maxVRAM 14.64 GiB; TEXT DIFFERS; worse: decode 105.51 vs 111.28",
+   "keep": false,
+   "metric_value": 105.51,
+   "ref_value": 111.28,
+   "variants": [
+    {
+     "label": "hybrid-r80-hybridmaxfetch-0",
+     "value": "--moe-hybrid-max-fetch 0",
+     "ok": true,
+     "metric": 40.33,
+     "ref": 111.28,
+     "text_same": false,
+     "worse": [
+      "decode 40.33 vs 111.28"
+     ],
+     "pass": false
+    },
+    {
+     "label": "hybrid-r80-hybridmaxfetch-2",
+     "value": "--moe-hybrid-max-fetch 2",
+     "ok": true,
+     "metric": 102.96,
+     "ref": 111.28,
+     "text_same": false,
+     "worse": [
+      "decode 102.96 vs 111.28"
+     ],
+     "pass": false
+    },
+    {
+     "label": "hybrid-r80-hybridmaxfetch-4",
+     "value": "--moe-hybrid-max-fetch 4",
+     "ok": true,
+     "metric": 105.51,
+     "ref": 111.28,
+     "text_same": false,
+     "worse": [
+      "decode 105.51 vs 111.28"
+     ],
+     "pass": false
+    }
+   ]
+  },
+  {
+   "id": "locked-max-fetch",
+   "kind": "arg",
+   "name": "--moe-locked-max-fetch",
+   "lossless": true,
+   "status": "safe",
+   "values": [
+    "--moe-locked-max-fetch 4",
+    "--moe-locked-max-fetch 16"
+   ],
+   "note": "2026-11-12: default 8; applies only to layers left locked by --moe-cpu-layers auto; costs pinned staging per bank",
+   "value": "--moe-locked-max-fetch 16",
+   "result": "`--moe-locked-max-fetch 4`: decode 101.23 tok/s; minRAM 2.72 GiB, maxVRAM 14.66 GiB; text identical; worse: decode 101.23 vs 111.28 | `--moe-locked-max-fetch 16`: decode 103.21 tok/s; minRAM 2.62 GiB, maxVRAM 14.65 GiB; text identical; worse: decode 103.21 vs 111.28",
+   "keep": false,
+   "metric_value": 103.21,
+   "ref_value": 111.28,
+   "variants": [
+    {
+     "label": "hybrid-r80-lockedmaxfetch-4",
+     "value": "--moe-locked-max-fetch 4",
+     "ok": true,
+     "metric": 101.23,
+     "ref": 111.28,
+     "text_same": true,
+     "worse": [
+      "decode 101.23 vs 111.28"
+     ],
+     "pass": false
+    },
+    {
+     "label": "hybrid-r80-lockedmaxfetch-16",
+     "value": "--moe-locked-max-fetch 16",
+     "ok": true,
+     "metric": 103.21,
+     "ref": 111.28,
+     "text_same": true,
+     "worse": [
+      "decode 103.21 vs 111.28"
+     ],
+     "pass": false
+    }
+   ]
+  },
+  {
+   "id": "prefill-chunk",
+   "kind": "arg",
+   "name": "--max-prefill-length",
+   "lossless": true,
+   "status": "safe",
+   "values": [
+    "--max-prefill-length 2048",
+    "--max-prefill-length 4096"
+   ],
+   "tests": "decode,p5k",
+   "metric": "prefill:p5k",
+   "note": "2026-11-12: default chunk is 8192 (scheduler config); judged on 5K-prompt prefill speed",
+   "value": "--max-prefill-length 4096",
+   "result": "`--max-prefill-length 2048`: decode 100.94 tok/s, p5k 93.02 tok/s; minRAM 2.52 GiB, maxVRAM 14.88 GiB; prefill:p5k 1765.4 vs 2684.4; text identical; worse: 5K prefill 1765.4 vs 2684.4 | `--max-prefill-length 4096`: decode 106.6 tok/s, p5k 95.98 tok/s; minRAM 2.46 GiB, maxVRAM 15.12 GiB; prefill:p5k 2126.7 vs 2684.4; text identical; worse: 5K prefill 2126.7 vs 2684.4",
+   "keep": false,
+   "metric_value": 2126.7,
+   "ref_value": 2684.4,
+   "variants": [
+    {
+     "label": "hybrid-r80-prefillchunk-2048",
+     "value": "--max-prefill-length 2048",
+     "ok": true,
+     "metric": 1765.4,
+     "ref": 2684.4,
+     "text_same": true,
+     "worse": [
+      "5K prefill 1765.4 vs 2684.4"
+     ],
+     "pass": false
+    },
+    {
+     "label": "hybrid-r80-prefillchunk-4096",
+     "value": "--max-prefill-length 4096",
+     "ok": true,
+     "metric": 2126.7,
+     "ref": 2684.4,
+     "text_same": true,
+     "worse": [
+      "5K prefill 2126.7 vs 2684.4"
+     ],
+     "pass": false
+    }
+   ]
+  },
+  {
+   "id": "cache-scope-per-layer",
+   "kind": "arg",
+   "name": "--moe-cache-scope",
+   "value": "--moe-cache-scope per-layer",
+   "lossless": true,
+   "status": "safe",
+   "tests": "decode,p5k",
+   "note": "2026-11-12: one slot pool per layer (equal split) against the unified pool",
+   "result": "decode 97.93 tok/s, p5k 92.51 tok/s; minRAM 2.3 GiB, maxVRAM 15.23 GiB; TEXT DIFFERS",
+   "keep": false,
+   "metric_value": 97.93,
+   "ref_value": 101.17,
+   "variants": [
+    {
+     "label": "hybrid-r80-cachescopeperlayer",
+     "value": "--moe-cache-scope per-layer",
+     "ok": true,
+     "metric": 97.93,
+     "ref": 101.17,
+     "text_same": false,
+     "worse": [],
+     "pass": false
+    }
+   ]
+  },
+  {
+   "id": "prefill-hit-d2d",
+   "kind": "arg",
+   "name": "--moe-prefill-hit-d2d",
+   "value": "--moe-prefill-hit-d2d",
+   "lossless": true,
+   "status": "candidate",
+   "tests": "decode,p5k",
+   "metric": "prefill:p5k",
+   "note": "2026-11-12: not run: with --moe-cpu-layers auto and locked layers the engine forces prefill overlap off, so this does nothing (engine.py:1035). Try only on a model with no locked layers; the log says 'hit-D2D requested but unavailable' if HIP batch copy fails.",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "prefill-no-overlap",
+   "kind": "arg",
+   "name": "--disable-moe-prefill-overlap",
+   "value": "--disable-moe-prefill-overlap",
+   "lossless": true,
+   "status": "candidate",
+   "tests": "decode,p5k",
+   "metric": "prefill:p5k",
+   "note": "2026-11-12: not run: overlap is already off under split residency (see prefill-hit-d2d)",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "cache-split-profile",
+   "kind": "arg",
+   "name": "--moe-cache-split",
+   "value": "",
+   "lossless": true,
+   "status": "candidate",
+   "note": "2026-11-12: needs --moe-cache-scope per-layer and a profile file {model, expert_counts[L][E]}; no tool writes one yet (FT_EXPERT_FREQ's decode matrix could be wrapped). Expert skew measured weak on the 35B, so low priority.",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "kv-cache-fp8",
+   "kind": "arg",
+   "name": "--kv-cache-dtype",
+   "value": "--kv-cache-dtype fp8_per_token_head",
+   "lossless": false,
+   "status": "candidate",
+   "note": "2026-11-13 (upstream #894): 8-bit KV, about half the KV memory, so more context per GB. Lossy, so never auto-kept. Needs --dtype bfloat16; never loaded on ROCm. int8_per_token_head is the other format.",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "spec-token-map",
+   "kind": "arg",
+   "name": "--speculative-token-map",
+   "value": "",
+   "lossless": true,
+   "status": "candidate",
+   "note": "2026-11-13 (upstream #892): MTP draft scores only the ids in a map file; target still verifies the whole vocabulary. Needs a file from scripts/make_token_map.py MODEL (tokenizer only) and belongs in the spec stage (MTP on), not here.",
+   "result": "not run (candidate)"
+  },
+  {
+   "id": "online-quant-df11",
+   "kind": "arg",
+   "name": "--online-quant",
+   "value": "--online-quant df11",
+   "lossless": true,
+   "status": "candidate",
+   "note": "2026-11-13 (upstream #891): lossless ~11 bit packing of bf16 layers only, about 30% less VRAM for those, a decode per use. A GGUF-quantized model like the 35B IQ4_NL has few or no bf16 Linear layers, so probably refused there.",
+   "result": "not run (candidate)"
+  }
+ ],
+ "parallel": {
+  "rows": [
+   {
+    "n": 2,
+    "graph_bs": 2,
+    "extra": null,
+    "ok": true,
+    "total_tps": 160.53,
+    "per_req_tps": [
+     80.29,
+     80.11
+    ],
+    "single_tps": 102.03,
+    "kv_tokens": 260419,
+    "max_vram_gib": 14.65,
+    "min_ram_gib": 1.4,
+    "error": null
+   },
+   {
+    "n": 4,
+    "graph_bs": 4,
+    "extra": null,
+    "ok": true,
+    "total_tps": 245.7,
+    "per_req_tps": [
+     61.31,
+     61.34,
+     61.34,
+     61.34
+    ],
+    "single_tps": 110.75,
+    "kv_tokens": 222691,
+    "max_vram_gib": 14.68,
+    "min_ram_gib": 1.9,
+    "error": null
+   },
+   {
+    "n": 8,
+    "graph_bs": 8,
+    "extra": null,
+    "ok": true,
+    "total_tps": 267.0,
+    "per_req_tps": [
+     33.31,
+     33.33,
+     33.33,
+     33.33,
+     33.33,
+     33.33,
+     33.33,
+     33.33
+    ],
+    "single_tps": 115.5,
+    "kv_tokens": 147235,
+    "max_vram_gib": 14.62,
+    "min_ram_gib": 1.45,
+    "error": null
+   },
+   {
+    "n": 4,
+    "graph_bs": 1,
+    "extra": null,
+    "ok": true,
+    "total_tps": 58.99,
+    "per_req_tps": [
+     14.72,
+     14.78,
+     14.78,
+     14.78
+    ],
+    "single_tps": 114.74,
+    "kv_tokens": 222691,
+    "max_vram_gib": 14.54,
+    "min_ram_gib": 1.56,
+    "error": null
+   },
+   {
+    "n": 2,
+    "graph_bs": 2,
+    "extra": "--speculative-algorithm dflash --speculative-num-steps 3 --speculative-draft-model-path E:/ai-models/ft-models/jzinno_Ornith-1.5-35B-A3B-DFlash2",
+    "ok": true,
+    "total_tps": 110.88,
+    "per_req_tps": [
+     58.19,
+     56.63
+    ],
+    "single_tps": 98.07,
+    "kv_tokens": 177281,
+    "max_vram_gib": 14.61,
+    "min_ram_gib": 1.16,
+    "error": null
+   },
+   {
+    "n": 4,
+    "graph_bs": 4,
+    "extra": "--speculative-algorithm dflash --speculative-num-steps 3 --speculative-draft-model-path E:/ai-models/ft-models/jzinno_Ornith-1.5-35B-A3B-DFlash2",
+    "ok": true,
+    "total_tps": 182.64,
+    "per_req_tps": [
+     50.52,
+     50.85,
+     50.17,
+     47.93
+    ],
+    "single_tps": 96.78,
+    "kv_tokens": 118491,
+    "max_vram_gib": 14.67,
+    "min_ram_gib": 1.18,
+    "error": null
+   }
+  ],
+  "best_n": 8,
+  "plain_tps": 111.28,
+  "extra": "--speculative-algorithm dflash --speculative-num-steps 3 --speculative-draft-model-path E:/ai-models/ft-models/jzinno_Ornith-1.5-35B-A3B-DFlash2"
+ }
+}

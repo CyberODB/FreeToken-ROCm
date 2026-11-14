@@ -27,6 +27,9 @@ if /i "%~1"=="serve" goto :serve
 exit /b %ERRORLEVEL%
 :serve
 set "ARGS=%ARGS:~5%"
-if not defined FT_GRAPH_MAX_BS set "FT_GRAPH_MAX_BS=1"
-"%REPO%\.venv\Scripts\ft.exe" serve --cuda-graph-max-bs %FT_GRAPH_MAX_BS% %ARGS%
+rem 2026-11-14: default auto = no flag, the engine sets graph bs = --max-running-requests (upstream). Undo: default back to 1.
+if not defined FT_GRAPH_MAX_BS set "FT_GRAPH_MAX_BS=auto"
+set "GRAPH_ARG=--cuda-graph-max-bs %FT_GRAPH_MAX_BS%"
+if /i "%FT_GRAPH_MAX_BS%"=="auto" set "GRAPH_ARG="
+"%REPO%\.venv\Scripts\ft.exe" serve %GRAPH_ARG% %ARGS%
 exit /b %ERRORLEVEL%

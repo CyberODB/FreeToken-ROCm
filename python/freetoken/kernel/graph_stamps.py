@@ -167,3 +167,13 @@ def stamp(phase: str, layer: int = -1) -> None:
     s = get() if EVERY > 0 else None
     if s is not None:
         s.stamp(phase, layer)
+
+
+# FREETOKEN_GRAPH_STAMPS_FINE=1 adds stamps inside the layer (norms, GDN steps, router, shared expert).
+# Each one is an extra one-thread kernel, so fine runs are slower; compare them with each other only.
+FINE = EVERY > 0 and os.environ.get("FREETOKEN_GRAPH_STAMPS_FINE") == "1"
+
+
+def fine(phase: str, layer: int = -1) -> None:
+    if FINE:
+        stamp(phase, layer)

@@ -6,6 +6,7 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
+from freetoken.kernel.graph_stamps import fine as _fine
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -160,6 +161,7 @@ class GatedDeltaNet(BaseOP):
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
+        _fine("GDN in_proj", self.layer_id)
 
         if not batch.is_prefill:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
@@ -173,10 +175,12 @@ class GatedDeltaNet(BaseOP):
                 mixed = self._conv_verify(conv_in, fla, pool)
             else:
                 mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            _fine("GDN conv", self.layer_id)
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            _fine("GDN q/k/v cast", self.layer_id)
             core_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log, a=a, dt_bias=self.dt_bias,  # already fp32 (stored fp32)
                 softplus_beta=1.0, softplus_threshold=20.0,
@@ -186,6 +190,7 @@ class GatedDeltaNet(BaseOP):
                 scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
                 disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
             )[0]  # [total, num_v, V]
+            _fine("GDN recurrent", self.layer_id)
         else:
             from freetoken.kernel.fla import chunk_gated_delta_rule
 
@@ -216,10 +221,12 @@ class GatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        _fine("GDN gated norm", self.layer_id)
         if self._out_heads_tiled:
             # grouped value heads (k-head major) -> tiled (k-head minor), the column order of a GGUF ssm_out
             r = self.num_v_heads // self.num_k_heads
             out = out.view(total, self.num_k_heads, r, self.head_v_dim).transpose(1, 2).reshape(total, -1)
+            _fine("GDN head re-tile copy", self.layer_id)
         return self.out_proj.forward(out)
 
 

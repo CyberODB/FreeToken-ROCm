@@ -101,6 +101,31 @@ def _cu_graph_upload():
     return fn
 
 
+_NODE_TYPES = {0: "kernel", 1: "memcpy", 2: "memset", 3: "host", 4: "child graph", 5: "empty",
+               6: "wait event", 7: "event record"}
+COUNT_NODES = __import__("os").environ.get("FT_GRAPH_NODES") == "1"
+
+
+def _count_graph_nodes(graph: torch.cuda.CUDAGraph, bs: int) -> None:
+    """FT_GRAPH_NODES=1: log the captured graph's node count by type (HIP only). Needs keep_graph=True."""
+    try:
+        hip = ctypes.CDLL("amdhip64_7.dll" if sys.platform == "win32" else "libamdhip64.so")
+        g = ctypes.c_void_p(graph.raw_cuda_graph())
+        n = ctypes.c_size_t(0)
+        hip.hipGraphGetNodes(g, None, ctypes.byref(n))
+        nodes = (ctypes.c_void_p * n.value)()
+        hip.hipGraphGetNodes(g, nodes, ctypes.byref(n))
+        counts: Dict[str, int] = {}
+        t = ctypes.c_int(0)
+        for node in nodes:
+            hip.hipGraphNodeGetType(ctypes.c_void_p(node), ctypes.byref(t))
+            k = _NODE_TYPES.get(t.value, f"type {t.value}")
+            counts[k] = counts.get(k, 0) + 1
+        logger.info(f"[graph-nodes] bs={bs}: {n.value} nodes: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    except Exception as e:  # diagnostics only
+        logger.info(f"[graph-nodes] count failed: {e}")
+
+
 def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> None:
     """Upload the graph at capture time.
 
@@ -223,7 +248,7 @@ class GraphRunner:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
-            graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph(keep_graph=True) if COUNT_NODES else torch.cuda.CUDAGraph()
             batch = Batch(reqs=[self.dummy_req] * bs, phase=self.phase, rows_per_req=self.rows_per_req)
             batch.padded_reqs = batch.reqs
             if self.batch_hook is not None:
@@ -242,6 +267,9 @@ class GraphRunner:
                     self._store_output(bs, self.forward())
                     if stamps is not None:
                         stamps.stamp("final norm + head")
+                if COUNT_NODES:
+                    _count_graph_nodes(graph, bs)
+                    graph.instantiate()
                 _upload_graph(graph, self.stream)
                 self._reset_moe_offload_cache()
             if pool is None:

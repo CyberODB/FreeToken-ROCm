@@ -11,7 +11,7 @@ Other uses:
 Rules:
   * Kill when any floor is crossed for --samples samples in a row (1 s apart): free dedicated VRAM
     under --min-free-gib (0.4; hybrid/offload fill VRAM on purpose, ratio 0.85 sits at ~15.1 of 16 GiB),
-    available host RAM under --min-ram-gib (1.5) or free commit under --min-commit-gib (2.0).
+    available host RAM under --min-ram-gib (1.1) or free commit under --min-commit-gib (2.0).
     --watch kills the FreeToken GPU processes; wrap mode kills CMD's tree plus any python whose
     command line has --stale (default "--port 1925", an orphaned probe server). Browsers etc. are never touched.
   * Wrap mode also kills such leftovers before the run and after it, waits until the killed PIDs are gone
@@ -25,16 +25,16 @@ Rules:
 Every kill also prints a plain-language "WHY / WHAT TO TRY" line, journals it as `tip`, and writes last-stop.txt in $FT_GUARD_DIR.
 Journal and killer list: $FT_GUARD_DIR (default %LOCALAPPDATA%\\freetoken-gpu-guard).
 Profiles (--profile or env FT_GUARD_PROFILE, default "debug"; explicit flags/env below still override a profile):
-  debug   strict, for GPU/expert/layer debugging where a crash is likely: free VRAM 0.2, RAM 1.5, commit 2.0 GiB, 2 samples
+  debug   strict, for GPU/expert/layer debugging where a crash is likely: free VRAM 0.2, RAM 1.1, commit 2.0 GiB, 2 samples
   normal  everyday model serving (Hermes chat): VRAM 0.15, RAM 0.4, commit 0.75 GiB, 4 samples in a row (fires less);
           plus a soft RAM floor of 1.0 GiB that only counts while Pages Input/sec >= 2000 (real paging, not just low RAM)
-Env: FT_GUARD_MIN_FREE_GIB (0.4), FT_GUARD_MIN_RAM_GIB (1.5), FT_GUARD_MIN_COMMIT_GIB (2.0), FT_GUARD_SAMPLES (2),
+Env: FT_GUARD_MIN_FREE_GIB (0.4), FT_GUARD_MIN_RAM_GIB (1.1), FT_GUARD_MIN_COMMIT_GIB (2.0), FT_GUARD_SAMPLES (2),
      FT_GUARD_STALE ("--port 1925"), FT_GUARD_TOTAL_GIB (16), FT_GUARD_MATCH ("freetoken").
 """
 import argparse, csv, io, json, os, subprocess, sys, threading, time
 
 PROFILES = {  # floors (GiB) and samples in a row; "debug" = the original behaviour
-    "debug":  dict(free=0.2,  ram=1.5, commit=2.0,  samples=2, soft=0.0, page_in=0),  # VRAM 0.2: this model sits at ~0.33 free by design; 0.4 killed it in a loop
+    "debug":  dict(free=0.2,  ram=0.9, commit=2.0,  samples=2, soft=0.0, page_in=0),  # VRAM 0.2: this model sits at ~0.33 free by design; 0.4 killed it in a loop  # RAM 1.1 (was 1.5, 2026-11-13): 1.5 killed healthy LFM2 fits at 1.2-1.5 avail. Undo: ram=1.5
     # RAM 0.4 (was 1.0): the 35B hybrid model idles at only 1.1-2.0 GiB available and a Hermes prefill dips to ~0.65, so 1.0
     # killed healthy runs 20+ times on 2026-11-08 (commit free was ~11 GiB and the sampler never stalled). Undo: ram=1.0, samples=3.
     # soft=1.0/page_in=2000: below 1.0 GiB available RAM only counts as a breach while the box is also paging in (>2000 pages/s,

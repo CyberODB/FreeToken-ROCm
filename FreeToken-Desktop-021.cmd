@@ -20,7 +20,8 @@ set "PATH=%ROCM%\bin;%REPO%\.venv\Lib\site-packages\_rocm_sdk_libraries\bin;%REP
 set "CC=%ROCM%\lib\llvm\bin\clang-cl.exe"
 set "FREETOKEN_FT_BIN=%SRC%\bin\ft.cmd"
 rem CUDA graph ladder for the daemon: 0 = off, then 1, 2, 4. See serve_manager.py. Default 1 since 2026-11-05.
-set "FT_GRAPH_MAX_BS=1"
+rem 2026-11-14: auto = graph bs follows --max-running-requests (upstream; 4x total tok/s at 4 requests). Undo: set it back to 1.
+set "FT_GRAPH_MAX_BS=auto"
 rem 2026-11-05: graphs in hybrid decode via the kernel spin-wait handshake (test B: 47-58 tok/s vs 12-14.5 off).
 rem An argument sets the ladder top: FreeToken-Desktop-021.cmd 0 turns graphs off.
 if not "%~1"=="" set "FT_GRAPH_MAX_BS=%~1"
@@ -39,6 +40,9 @@ set "FT_EXTRA_SERVE_ARGS=--moe-cpu-layers auto %FT_MEASURE_ARGS%"
 rem Test 2026-11-06: 15 GiB (was 14): one more GiB pinned instead of locked, same total RAM. Driver refused near ~14
 rem in the 11-03 probe, so a load error here means back to 14. Undo: set back to 14.
 set "FREETOKEN_PIN_BUDGET_GB=15"
+rem 2026-11-08 (commit b5038e7): locked layers' down banks read the GGUF file instead of a RAM copy (2.42 GiB less commit at
+rem budget 7, output identical). Only layers the pin budget leaves LOCKED are affected. Undo: delete this line.
+set "FREETOKEN_MAP_LOCKED_BANKS=1"
 rem 2026-11-06: RAM check before each load (python\freetoken\ram_preflight.py). 14 GiB = desktop with a YouTube video
 rem and Claude running, 11.8 measured by T:\robot\tools\tools\ram-baseline.py, + 2 margin. If the model won't fit in
 rem free RAM a window says why and offers to close programs, then loads anyway. Undo: delete this line.

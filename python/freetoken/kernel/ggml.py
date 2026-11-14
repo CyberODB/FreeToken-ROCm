@@ -30,6 +30,12 @@ def load_module(build_directory: str | None = None) -> Module:
     ]
     if _is_rocm():
         flags = ["-ffast-math", "-DGGML_USE_HIP"]
+        if nw := __import__("os").environ.get("FT_P4_MMVQ_NW"):  # phase 4 experiment: separate build (new flag hash)
+            flags.append(f"-DFT_P4_MMVQ_NW={int(nw)}")
+        if mq := __import__("os").environ.get("FT_P4_MMQ_MIN_M"):
+            flags.append(f"-DFT_P4_MMQ_MIN_M={int(mq)}")
+        if mn := __import__("os").environ.get("FT_P4_MMQ_MIN_N"):
+            flags.append(f"-DFT_P4_MMQ_MIN_N={int(mn)}")
     else:
         # a multi-arch kernel-cache build is ~6x smaller with compressed SASS
         flags = ["-use_fast_math", "--extended-lambda", "--compress-mode=size"]
