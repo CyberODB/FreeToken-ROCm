@@ -23,6 +23,8 @@ Stages: 1 inventory/size check, 2 upgrades (MTP), 3 strategy, 4 memory ratio, 4s
 2026-11-14 (undo: ft-fit.py.bak-20261114-fitflow): 4-squeeze when no hybrid ratio loads (mr1, then 3000 slots, then naive
   cache; first that loads wins); 8-bit KV only as a rescue when 16-bit misses the floor (lossy, own launch line);
   winner calls under 5% rerun both sides; dense class default --max-prefill-length 2048; the card's "What failed" section.
+  Later the same day (undo: ft-fit.py.bak-20261114-slotroom): a hybrid run whose 5000 expert slots do not fit is retried once
+  at the room the engine reports, and the squeeze never asks for more than that room.
 Pass/fail comes from the probe's results.jsonl row (its exit code is 0 on a failed load), kills from the
 guard journal. Results go to speedprobe/fit/<model>.jsonl; a rerun reuses rows with the same name and args.
 Stdlib only, never imports torch.
@@ -307,10 +309,12 @@ class Runner:
             # 2026-11-12: engine.py logs "--moe-cache-auto resolved moe_cache_size=N num_pages=P (prefill_overlap=..)"
             sa = re.findall(r"moe-cache-auto resolved moe_cache_size=(\d+)", lg)
             r["slots_auto"] = int(sa[-1]) if sa else None
+            r["slots_room"] = None if r["ok"] else slots_room_in(lg)
         except OSError:
             r["kv_tokens"] = None
             r["kv_short"] = False
             r["slots_auto"] = None
+            r["slots_room"] = None
         with open(self.state_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(r) + "\n")
         print(f"      -> {fmt(r)}")
@@ -372,6 +376,27 @@ def decide(R: "Runner", new: dict | None, old: dict | None, notes: list[str], wh
 
 # ---------- ladder ----------
 
+def slots_room_in(text: str) -> int | None:
+    """2026-11-14: "MoE cache of 5000 slots exceeds what the pools can hold (3840 slots)" -> 3840."""
+    m = re.findall(r"exceeds what the pools can hold \((\d+) slots\)", text or "")
+    return int(m[-1]) if m and int(m[-1]) > 0 else None
+
+
+def slots_room(r: dict | None) -> int | None:
+    """The slot room of a failed run: from the row, or (rows saved before 2026-11-14) from its error or log."""
+    if not r or r.get("ok"):
+        return None
+    if r.get("slots_room"):
+        return r["slots_room"]
+    n = slots_room_in(str(r.get("error")))
+    if n is None and r.get("name"):
+        try:
+            n = slots_room_in(open(os.path.join(PROBE_OUT, f"{r['name']}.log"), encoding="utf-8", errors="replace").read())
+        except OSError:
+            pass
+    return n
+
+
 def ladder(inv: dict, a) -> dict:
     R = Runner(inv["model"], a.max_runs, a.load_timeout, a.tag, a.ctx, a.fresh)
     if a.reserve_gib:
@@ -414,6 +439,14 @@ def ladder(inv: dict, a) -> dict:
             r = R.run("4-ratio", f"{strat}-r{int(ratio * 100)}", base + ["--memory-ratio", f"{ratio:.2f}"], base_args=strat != "fused")
             if r is None:
                 break
+            room = slots_room(r) if strat == "hybrid" else None
+            if room:  # 2026-11-14: gemma4 IQ3_XS (3840) and LFM2 Q5_K_L (2432) never loaded on the probe's fixed 5000 slots
+                notes.append(f"{strat} at ratio {ratio:.2f}: the 5000-slot expert cache does not fit (the engine has room for {room}); retried at {room}")
+                R.max_runs += 1  # the retry does not eat the later stages' budget
+                again = R.run("4-ratio", f"{strat}-r{int(ratio * 100)}-s{room}", base + ["--memory-ratio", f"{ratio:.2f}", "--moe-cache-size", str(room)])
+                if again is None:
+                    break
+                r = again
             if not r["ok"]:
                 notes.append(f"{strat} at ratio {ratio:.2f} failed: {err(r)}")
                 if kv_short(r) and strat == "hybrid" and last is None:
@@ -435,9 +468,14 @@ def ladder(inv: dict, a) -> dict:
         ram = any("available RAM" in str(r.get("error")) for r in fails)
         ratio = f"{max(RATIOS) if fails and all(kv_short(r) for r in fails) else min(RATIOS):.2f}"
         base = ["--moe-strategy", "hybrid", "--memory-ratio", ratio]
-        steps = [("mr1", ["--max-running-requests", "1"]),
-                 ("mr1-s3000", ["--max-running-requests", "1", "--moe-cache-size", "3000"]),
-                 ("mr1-s3000-naive", ["--max-running-requests", "1", "--moe-cache-size", "3000", "--cache-type", "naive"])]
+        rooms = [n for n in (slots_room(r) for r in fails) if n]
+        cap = min(rooms) if rooms else None  # 2026-11-14: the smallest slot room a ratio run reported
+        sq = min(3000, cap) if cap else 3000
+        steps = [("mr1" + (f"-s{cap}" if cap else ""), ["--max-running-requests", "1"] + (["--moe-cache-size", str(cap)] if cap else [])),
+                 (f"mr1-s{sq}", ["--max-running-requests", "1", "--moe-cache-size", str(sq)]),
+                 (f"mr1-s{sq}-naive", ["--max-running-requests", "1", "--moe-cache-size", str(sq), "--cache-type", "naive"])]
+        if cap == sq:
+            steps.pop(1)  # same as the first step
         if ram:
             notes.append("MoE squeeze skipped: host RAM ran out (the guard stopped a run), and the squeeze steps only free VRAM")
         else:
@@ -527,7 +565,7 @@ def ladder(inv: dict, a) -> dict:
     use = spec if spec and decide(R, spec, plain, notes, "spec vs plain decode") else plain
     slots = None
     if "--moe-cache-size" in use["args"]:  # 2026-11-14: the squeeze ladder already cut the slots to load; the sweep's 5000 ref failed
-        notes.append("slot sweep skipped: the squeeze ladder fixed the slot count (" + use["args"][use["args"].index("--moe-cache-size") + 1] + ")")
+        notes.append("slot sweep skipped: the squeeze ladder or the slot-room retry fixed the slot count (" + use["args"][use["args"].index("--moe-cache-size") + 1] + ")")
     elif inv.get("experts") and "hybrid" in use["args"] and not a.no_slots:
         # 2026-11-13: a model with at most 5000 experts can't run the sweep (5000 and up exceed its pools), so it gets auto too
         few = int(inv.get("layers") or 0) * int(inv.get("experts") or 0) <= 5000
@@ -1051,6 +1089,10 @@ def advice(res: dict) -> list[str]:
         out.append(head("not enough VRAM for the KV cache") + " on some loads. Try: " + tips(
             ([("--moe-cache-size", "fewer expert slots (`--moe-cache-size 3000`)")] if moe else [("--embed-weights", "`--embed-weights host`"), ("", "a smaller quant")])
             + [("--max-running-requests", "`--max-running-requests 1`"), ("--cache-type", "`--cache-type naive`"), ("--kv-cache-dtype", "8-bit KV (lossy)")]) + ".")
+    rooms = sorted({n for n in (slots_room(r) for r in fails) if n})
+    if rooms:
+        out.append(head("the 5000-slot expert cache did not fit") + f" (the engine had room for {', '.join(map(str, rooms))}); "
+                   "the fit retries at that room. By hand: `--moe-cache-size` at or under it.")
     logs = [m[1] for e in errs for m in [re.search(r"exited \(15\).*?see (\S+)", e)] if m]
     if logs:
         out.append(head("the server died during load") + f" on {len(logs)} run(s) (exit 15). First log: `{logs[0]}`")
