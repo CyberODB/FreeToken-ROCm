@@ -7,17 +7,17 @@
 </div>
 
 > [!NOTE]
-> **This branch (`win-rocm-021`): Windows + AMD ROCm test build on [FreeToken](https://github.com/FlashML-org/FreeToken) v0.2.1.**
-> FreeToken is by FlashML-org (Apache 2.0), and v0.2.1 includes upstream's own ROCm support.
+> **This branch (`win-rocm-022`): Windows + AMD ROCm test build on [FreeToken](https://github.com/FlashML-org/FreeToken) v0.2.2.**
+> FreeToken is by FlashML-org (Apache 2.0), and v0.2.2 includes upstream's own ROCm support.
 > Maxritz's [FreeToken-ROCm](https://github.com/Maxritz/FreeToken-ROCm) first showed that FreeToken could run on Windows with AMD ROCm,
 > and this branch would not exist without it. The Windows/ROCm work here started from his fork
 > (with contributions from PialGhosh2233, Castoff995, Elliot, Aron van Ammers, Roman Baumer and Daniel Bittencourt);
-> parts of it are re-applied here on top of v0.2.1, with Windows daemon, launcher and RX 9070 fixes
-> by CyberODB, made with help from Claude. The older port with Maxritz's full history is on `main`.
+> parts of it are re-applied here on top of v0.2.2, with Windows daemon, launcher and RX 9070 fixes
+> by CyberODB, made with help from Claude. The older port with Maxritz's full history is on `main`; the v0.2.1 build is on `win-rocm-021`.
 
 ## Windows + ROCm milestones (this branch)
 
-Measured on an AMD Radeon RX 9070 (gfx1201, 16 GB), Windows 11, 32 GB RAM, model on a SATA SSD,
+Measured on the v0.2.1 base, on an AMD Radeon RX 9070 (gfx1201, 16 GB), Windows 11, 32 GB RAM, model on a SATA SSD,
 with HauhauCS Qwen3.6-35B-A3B IQ4_NL GGUF in hybrid MoE mode (experts in host RAM, run on the CPU and GPU).
 
 | What | Before | After |
