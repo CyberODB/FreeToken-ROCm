@@ -1439,7 +1439,7 @@ def winner(res: dict) -> dict:
     ram = [r["min_ram_gib"] for r in (win, confirm) if r and r.get("min_ram_gib") is not None]
     vram = [r["max_vram_gib"] for r in (win, confirm) if r and r.get("max_vram_gib") is not None]
     # tps is the as-stamped run's (the whole launch line in one process); ladder_tps is the same config's earlier ladder run
-    out.update(probe_env=R.probe_env)  # 2026-11-14: the engine env under every run, so a bench can tell if it serves the same
+    out.update(probe_env={k: os.environ.get(k, v) for k, v in daemon_env().items()})  # same as Runner.probe_env (no Runner here). 2026-11-14: the engine env under every run, so a bench can tell if it serves the same
     out.update(args=" ".join(args), cache=cache, head=head, env=keep_env, pick="spec" if is_spec else "plain",
                tps=tps(confirm) if done else tps(win), final_tps=tps(confirm) if done else None, ladder_tps=tps(win),
                plain_tps=tps(best), spec_tps=tps(spec) if spec else None,
