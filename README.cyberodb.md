@@ -14,8 +14,9 @@
 > kernels and hipcc/tvm-ffi JIT-compiled CUDA-C++ kernels. See
 > [Windows ROCm port](#windows-rocm-port) below for requirements, setup and switches.
 >
-> **Newer work is on [`win-rocm-021`](https://github.com/CyberODB/FreeToken-ROCm/tree/win-rocm-021)**
-> (FreeToken v0.2.1 base): HIP graphs in hybrid MoE decode at 47-58 tok/s (was 12-14.5), GGUF
+> **Newer work is on [`win-rocm-022`](https://github.com/CyberODB/FreeToken-ROCm/tree/win-rocm-022)**
+> (FreeToken v0.2.2 base). The v0.2.1 build stays on [`win-rocm-021`](https://github.com/CyberODB/FreeToken-ROCm/tree/win-rocm-021)
+> (measured there): HIP graphs in hybrid MoE decode at 47-58 tok/s (was 12-14.5), GGUF
 > expert banks loading in 35 s (was 86-87 s) and faster startup, measured on an RX 9070 with
 > Qwen3.6-35B-A3B IQ4_NL. See that branch's README for the table and switches.
 >
