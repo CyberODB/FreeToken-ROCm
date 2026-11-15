@@ -93,7 +93,20 @@ def get_free_memory(device: torch.device) -> int:
 
 @functools.cache
 def _cu_graph_upload():
-    if sys.platform != "linux" or torch.version.hip is not None:
+    if torch.version.hip is not None:
+        # ROCm fork probe 2026-11-14: FT_GRAPH_UPLOAD=1 tries hipGraphUpload (exported by amdhip64_7.dll, untested).
+        # Default off = behaviour unchanged. A failure is logged and the upload is skipped from then on.
+        if __import__("os").environ.get("FT_GRAPH_UPLOAD") != "1":
+            return None
+        try:
+            fn = ctypes.CDLL("amdhip64_7.dll" if sys.platform == "win32" else "libamdhip64.so").hipGraphUpload
+        except (OSError, AttributeError) as e:
+            logger.info(f"[graph-upload] hipGraphUpload not available: {e}")
+            return None
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+        return fn
+    if sys.platform != "linux":
         return None
     fn = ctypes.CDLL("libcuda.so.1").cuGraphUpload
     fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -126,13 +139,29 @@ def _count_graph_nodes(graph: torch.cuda.CUDAGraph, bs: int) -> None:
         logger.info(f"[graph-nodes] count failed: {e}")
 
 
+_hip_upload_off = False
+
+
 def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> None:
     """Upload the graph at capture time.
 
     Otherwise the first replay pushes every node behind the graph's own stream WAIT, and a large graph then blocks cudaGraphLaunch until the WAIT is released. PLE wait-sync releases it only after the launch returns, so that deadlocks.
     """
+    global _hip_upload_off
     upload = _cu_graph_upload()
-    if upload is None:
+    if upload is None or _hip_upload_off:
+        return
+    if torch.version.hip is not None:  # probe: never fail the load over it
+        try:
+            rc = upload(graph.raw_cuda_graph_exec(), stream.cuda_stream)
+        except Exception as e:
+            rc = repr(e)
+        if rc != 0:
+            _hip_upload_off = True
+            logger.info(f"[graph-upload] hipGraphUpload failed ({rc}); skipped for the remaining graphs")
+            return
+        stream.synchronize()
+        logger.info("[graph-upload] hipGraphUpload ok")
         return
     rc = upload(graph.raw_cuda_graph_exec(), stream.cuda_stream)
     if rc != 0:
@@ -280,6 +309,11 @@ class GraphRunner:
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        # ROCm fork probe 2026-11-14: is expandable_segments working? A large reserved - allocated gap means it is not.
+        reserved, allocated = torch.cuda.memory_reserved(self.device), torch.cuda.memory_allocated(self.device)
+        logger.info_rank0(
+            f"[alloc-probe] reserved {mem_GB(reserved)}, allocated {mem_GB(allocated)}, gap {mem_GB(reserved - allocated)}"
+        )
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return (

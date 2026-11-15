@@ -252,6 +252,36 @@ def _kernel_cache_dir() -> pathlib.Path | None:
     return pathlib.Path(get_jit_cache_dir()).expanduser()
 
 
+@cache
+def _install_ninja_fastpath() -> None:
+    """Windows: tvm_ffi runs every (even up-to-date) kernel build inside VsDevCmd.bat, ~2.4 s each
+    (measured 2026-11-14), several times per load and once more on the first prefix-cache hit.
+    A plain `ninja -n` (~0.03 s) still does all of ninja's checks (sources, headers, flags); only
+    when it reports nothing to do is the dev prompt skipped. Any doubt runs the original path.
+    FT_NINJA_FASTPATH=0 turns it off."""
+    if sys.platform != "win32" or os.getenv("FT_NINJA_FASTPATH", "1").strip() == "0":
+        return
+    import subprocess
+
+    import tvm_ffi.cpp.extension as ext
+
+    orig = ext.build_ninja
+    if getattr(orig, "_ft_fastpath", False):
+        return
+
+    def build_ninja(build_dir: str) -> None:
+        try:
+            r = subprocess.run(["ninja", "-n"], cwd=build_dir, capture_output=True, text=True, timeout=30)
+            if r.returncode == 0 and r.stdout.strip().endswith("ninja: no work to do."):
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        orig(build_dir)
+
+    build_ninja._ft_fastpath = True  # type: ignore[attr-defined]
+    ext.build_ninja = build_ninja
+
+
 def _load_prebuilt(name: str) -> Module | None:
     cache_dir = _kernel_cache_dir()
     if cache_dir is None:
@@ -320,6 +350,8 @@ def load_aot(
 
     from tvm_ffi.cpp import load
 
+    _install_ninja_fastpath()
+
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
     extra_cflags = extra_cflags or []
@@ -381,6 +413,8 @@ def load_jit(
             arch_list = _cuda_arch_list()
 
     from tvm_ffi.cpp import load_inline
+
+    _install_ninja_fastpath()
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []

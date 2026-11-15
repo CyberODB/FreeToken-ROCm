@@ -312,16 +312,69 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
+        # Load the radix compare kernel now: it is lazy, and without the prebuilt kernel cache its
+        # first use (the first prefix-cache hit) runs a ninja check in a dev prompt, ~2 s inside a
+        # request (found 2026-11-14 with FT_STALL_PROBE). A failure here keeps the old lazy path.
+        try:
+            from freetoken.kernel.radix import _load_radix_module
+
+            _load_radix_module()
+        except Exception as e:  # noqa: BLE001
+            logger.info_rank0(f"radix kernel warm-up skipped: {e!r}")
+        arm = self._stall_probe_setup()  # FT_STALL_PROBE=<secs>: debug only, no-op when unset
         if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
+                    arm()
                     self.normal_loop()
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
+                arm()
                 data = self.overlap_loop(data)
+
+    def _stall_probe_setup(self):
+        """Debug probe (FT_STALL_PROBE=0.8): dump all thread stacks to stderr when one scheduler
+        pass with work runs longer than that many seconds; the blocking idle wait is excluded.
+        Also logs gc collections over 50 ms. Returns the per-pass arm function (no-op if unset)."""
+        try:
+            secs = float(os.environ.get("FT_STALL_PROBE", "") or 0)
+        except ValueError:
+            secs = 0.0
+        if secs <= 0:
+            return lambda: None
+        import faulthandler, gc, sys
+
+        def arm():
+            faulthandler.cancel_dump_traceback_later()
+            faulthandler.dump_traceback_later(secs, repeat=False, file=sys.stderr, exit=False)
+
+        recv = self.receive_msg
+
+        def receive_msg(blocking: bool = False):
+            if blocking:
+                faulthandler.cancel_dump_traceback_later()
+            t0 = time.perf_counter()
+            out = recv(blocking=blocking)
+            if blocking:
+                print(f"[stall-probe] {time.time():.3f} woke after {time.perf_counter() - t0:.3f}s idle, {len(out)} msg", file=sys.stderr, flush=True)
+                arm()
+            return out
+
+        self.receive_msg = receive_msg
+        gc_t = [0.0]
+
+        def gc_cb(phase, info):
+            if phase == "start":
+                gc_t[0] = time.perf_counter()
+            elif (dt := time.perf_counter() - gc_t[0]) > 0.05:
+                print(f"[stall-probe] gc gen{info.get('generation')} {dt:.3f}s collected {info.get('collected')}", file=sys.stderr, flush=True)
+
+        gc.callbacks.append(gc_cb)
+        print(f"[stall-probe] armed at {secs}s", file=sys.stderr, flush=True)
+        return arm
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
