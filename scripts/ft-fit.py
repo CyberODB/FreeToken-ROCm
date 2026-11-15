@@ -48,6 +48,37 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gguf_header import read_header, type_name  # noqa: E402
+from ft_daemon_env import daemon_env  # noqa: E402
+
+# 2026-11-14: a Windows GPU reset (TDR) kills a run from outside; the next load straight after can trip another one.
+# Undo for this block and its uses: restore ft-fit.py.bak-20261114-benchsafe.
+GPU_RESET_PAT = re.compile(r"hipError|unspecified launch|device lost|DEVICE_LOST|HIP abort|ROCm error", re.I)
+OOM_PAT = re.compile(r"out of memory|OutOfMemory", re.I)
+WER_QUEUE = r"C:\ProgramData\Microsoft\Windows\WER\ReportQueue"
+GPU_RESET_SETTLE_S, GPU_RESET_STOP = 20, 2
+RESETS = {"n": 0}  # GPU resets seen by this fit, for write_out
+
+
+def gpu_reset_since(t0: float, log_path: str) -> str | None:
+    """Why this looks like a Windows GPU reset since t0 (a LiveKernelEvent 141/193 report, or a HIP device error in the
+    run's own log, which the probe writes fresh each run), else None."""
+    try:
+        for d in os.listdir(WER_QUEUE):
+            st = os.stat(os.path.join(WER_QUEUE, d))  # creation time: WER touches the folder again later (13:59 report, 18:14 mtime)
+            if re.search(r"Kernel_(141|193)", d) and getattr(st, "st_birthtime", st.st_ctime) >= t0 - 5:
+                return "LiveKernelEvent " + re.search(r"Kernel_(141|193)", d).group(1)
+    except OSError:
+        pass
+    try:
+        if os.path.getmtime(log_path) < t0:  # a probe that never started leaves the last run's log: not this run's evidence
+            return None
+        for line in open(log_path, encoding="utf-8", errors="replace").read()[-65536:].splitlines():
+            m = GPU_RESET_PAT.search(line)
+            if m and not OOM_PAT.search(line):  # an out-of-memory error is a config result, not a reset
+                return m.group(0)
+    except OSError:
+        pass
+    return None
 
 GIB = 1 << 30
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -254,9 +285,18 @@ class Runner:
         if os.path.isfile(self.state_path) and not fresh:
             with open(self.state_path, encoding="utf-8") as f:
                 for line in f:
-                    r = json.loads(line)
-                    self.done[r["key"]] = r
+                    try:  # 2026-11-14: a line torn by a hard reset is skipped, not fatal
+                        r = json.loads(line)
+                        if r.get("gpu_reset"):  # 2026-11-14: a run killed by a Windows GPU reset says nothing about its config
+                            continue
+                        self.done[r["key"]] = r
+                    except (ValueError, KeyError, TypeError):
+                        continue
         self.base_env: dict = {}  # env on every run (the desktop VRAM reserve)
+        # 2026-11-14: the engine env ft-speedprobe adds under ours (the daemon launcher's, see ft_daemon_env.py). It is part of
+        # the reuse key, so rows probed at the old fixed pin 14 / graph bs 1 are not reused as if they were the daemon's config.
+        self.probe_env = {k: os.environ.get(k, v) for k, v in daemon_env().items()}
+        self.gpu_resets = 0  # Windows GPU resets during this fit; GPU_RESET_STOP of them end the fit
         self.runs = 0
         self.reused = 0
         self.log: list[dict] = []
@@ -267,13 +307,16 @@ class Runner:
         name = f"fit-{self.tag}-{label}"[:90]
         ctx = self.ctx if ctx is None else ctx
         env = {**self.base_env, **(env or {})} or None
-        key =json.dumps([name, args, tests, vision, env or {}, base_args] + ([ctx] if ctx else []))
+        key = json.dumps([name, args, tests, vision, env or {}, base_args] + ([ctx] if ctx else []) + [{"probe_env": self.probe_env}])
         if key in self.done:
             r = self.done[key]
             self.reused += 1
             print(f"  [{stage}] {label}: reused  {fmt(r)}")
             self.log.append(r)
             return r
+        if self.gpu_resets >= GPU_RESET_STOP:
+            print(f"  [{stage}] {label}: skipped, run budget spent (stopped after {self.gpu_resets} Windows GPU resets)")
+            return None
         if self.runs >= self.max_runs:
             print(f"  [{stage}] {label}: skipped, run budget ({self.max_runs}) spent")
             return None
@@ -324,10 +367,24 @@ class Runner:
             r["kv_short"] = False
             r["slots_auto"] = None
             r["slots_room"] = None
+        reset = gpu_reset_since(t0, os.path.join(PROBE_OUT, f"{name}.log"))  # ok runs too: the 11/14 13:59 reset hit a run that exited rc 0
+        if reset:  # 2026-11-14: Windows reset the GPU under this run: its numbers are void; wait, don't cache it, and stop after repeats
+            r["gpu_reset"] = True
+            r["error"] = f"Windows reset the GPU ({reset}): {r.get('error') or 'numbers discarded'}"
+            r["ok"] = False
+            self.gpu_resets += 1
+            RESETS["n"] = self.gpu_resets
         with open(self.state_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(r) + "\n")
         print(f"      -> {fmt(r)}")
-        self.done[key] = r
+        if reset:
+            if self.gpu_resets >= GPU_RESET_STOP:  # run() skips every later run ("run budget spent" in the notes)
+                print(f"      !! {self.gpu_resets} GPU resets in this fit: stopping it. The PC needs a look before more GPU runs.", flush=True)
+            else:
+                print(f"      .. GPU reset: waiting {GPU_RESET_SETTLE_S} s before the next run", flush=True)
+                time.sleep(GPU_RESET_SETTLE_S)
+        else:
+            self.done[key] = r
         self.log.append(r)
         return r
 
@@ -385,14 +442,14 @@ def decide(R: "Runner", new: dict | None, old: dict | None, notes: list[str], wh
 
 # ---------- ladder ----------
 
-ENGINE_PY = os.path.join(REPO, "python", "freetoken")
+ENGINE_SRC = os.path.join(REPO, "python", "freetoken")  # 2026-11-14: was a second ENGINE_PY, which hid the Python path above
 
 
 def engine_archs() -> set[str] | None:
     """2026-11-14: the GGUF architectures this engine can load (GGUF_ARCH_TO_REGISTRY in models/gguf/config.py), read as text
     so ft-fit stays stdlib-only. None when the file or the dict is not found (then the check is skipped, not failed)."""
     try:
-        src = open(os.path.join(ENGINE_PY, "models", "gguf", "config.py"), encoding="utf-8").read()
+        src = open(os.path.join(ENGINE_SRC, "models", "gguf", "config.py"), encoding="utf-8").read()
     except OSError:
         return None
     m = re.search(r"GGUF_ARCH_TO_REGISTRY[^=]*=\s*\{(.*?)\n\}", src, re.S)
@@ -403,7 +460,7 @@ def engine_types() -> dict[int, str] | None:
     """2026-11-14: ggml tensor type ids the engine's GGUF reader knows (GGMLQuantizationType in third_party/gguf/constants.py).
     Knowing a type is not proof a kernel runs it, but an id missing here cannot load."""
     try:
-        src = open(os.path.join(ENGINE_PY, "third_party", "gguf", "constants.py"), encoding="utf-8").read()
+        src = open(os.path.join(ENGINE_SRC, "third_party", "gguf", "constants.py"), encoding="utf-8").read()
     except OSError:
         return None
     m = re.search(r"class GGMLQuantizationType\(IntEnum\):\n(.*?)\n(?=\S)", src, re.S)
@@ -1371,6 +1428,7 @@ def winner(res: dict) -> dict:
     ram = [r["min_ram_gib"] for r in (win, confirm) if r and r.get("min_ram_gib") is not None]
     vram = [r["max_vram_gib"] for r in (win, confirm) if r and r.get("max_vram_gib") is not None]
     # tps is the as-stamped run's (the whole launch line in one process); ladder_tps is the same config's earlier ladder run
+    out.update(probe_env=R.probe_env)  # 2026-11-14: the engine env under every run, so a bench can tell if it serves the same
     out.update(args=" ".join(args), cache=cache, head=head, env=keep_env, pick="spec" if is_spec else "plain",
                tps=tps(confirm) if done else tps(win), final_tps=tps(confirm) if done else None, ladder_tps=tps(win),
                plain_tps=tps(best), spec_tps=tps(spec) if spec else None,
@@ -1464,12 +1522,17 @@ def main():
 def write_out(res: dict, a, m: str):
     os.makedirs(os.path.join(PROBE_OUT, "cards"), exist_ok=True)
     cp = os.path.join(PROBE_OUT, "cards", f"{a.tag or slug(m)}{'-tune' if res.get('tune') else ''}.md")  # a tune run never overwrites a model's card
+    stopped = RESETS["n"] >= GPU_RESET_STOP
+    if stopped:  # 2026-11-14: a fit cut short by GPU resets is not a fit: the bench must not take its partial winner as the newest good one
+        res.setdefault("notes", []).append(f"STOPPED after {RESETS['n']} Windows GPU resets: this card is partial, not a fit result. Re-fit once the PC is checked.")
     with open(cp, "w", encoding="utf-8") as f:
         f.write(card(res))
     print(f"  card: {cp}")
     if a.result:
         keys = ("stage", "label", "args", "tests", "vision", "env", "ok", "tps", "error", "min_ram_gib", "max_vram_gib", "load_s", "when")
         w = dict(winner(res), card=cp, log=[{k: r.get(k) for k in keys} for r in res["log"]])
+        if RESETS["n"]: w["gpu_resets"] = RESETS["n"]
+        if stopped: w["ok"] = False
         with open(a.result, "w", encoding="utf-8") as f:
             json.dump(w, f, indent=1)
         print(f"  result: {a.result}")

@@ -1,6 +1,6 @@
 @echo off
 rem ROCm shim for FreeToken Desktop: sets MSVC + ROCm env, then runs the ROCm-fork ft.
-rem For "serve" it adds --cuda-graph-max-bs 0 (gfx1201 graph-replay crash workaround) before the caller's args.
+rem For "serve" it adds --cuda-graph-max-bs %FT_GRAPH_MAX_BS% before the caller's args (default auto = no flag).
 setlocal
 set "REPO=E:\freetoken-rocm"
 set "SRC=E:\freetoken-021"

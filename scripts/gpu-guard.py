@@ -25,16 +25,16 @@ Rules:
 Every kill also prints a plain-language "WHY / WHAT TO TRY" line, journals it as `tip`, and writes last-stop.txt in $FT_GUARD_DIR.
 Journal and killer list: $FT_GUARD_DIR (default %LOCALAPPDATA%\\freetoken-gpu-guard).
 Profiles (--profile or env FT_GUARD_PROFILE, default "debug"; explicit flags/env below still override a profile):
-  debug   strict, for GPU/expert/layer debugging where a crash is likely: free VRAM 0.2, RAM 1.1, commit 2.0 GiB, 2 samples
+  debug   strict, for GPU/expert/layer debugging where a crash is likely: free VRAM 0.2, RAM 0.7, commit 2.0 GiB, 2 samples
   normal  everyday model serving (Hermes chat): VRAM 0.15, RAM 0.4, commit 0.75 GiB, 4 samples in a row (fires less);
           plus a soft RAM floor of 1.0 GiB that only counts while Pages Input/sec >= 2000 (real paging, not just low RAM)
-Env: FT_GUARD_MIN_FREE_GIB (0.4), FT_GUARD_MIN_RAM_GIB (1.1), FT_GUARD_MIN_COMMIT_GIB (2.0), FT_GUARD_SAMPLES (2),
+Env: FT_GUARD_MIN_FREE_GIB (0.2), FT_GUARD_MIN_RAM_GIB (0.7), FT_GUARD_MIN_COMMIT_GIB (2.0), FT_GUARD_SAMPLES (2),
      FT_GUARD_STALE ("--port 1925"), FT_GUARD_TOTAL_GIB (16), FT_GUARD_MATCH ("freetoken").
 """
 import argparse, csv, io, json, os, subprocess, sys, threading, time
 
 PROFILES = {  # floors (GiB) and samples in a row; "debug" = the original behaviour
-    "debug":  dict(free=0.2,  ram=0.9, commit=2.0,  samples=2, soft=0.0, page_in=0),  # VRAM 0.2: this model sits at ~0.33 free by design; 0.4 killed it in a loop  # RAM 1.1 (was 1.5, 2026-11-13): 1.5 killed healthy LFM2 fits at 1.2-1.5 avail. Undo: ram=1.5
+    "debug":  dict(free=0.2,  ram=0.7, commit=2.0,  samples=2, soft=0.0, page_in=0),  # VRAM 0.2: this model sits at ~0.33 free by design; 0.4 killed it in a loop  # RAM 0.7 (2026-11-14; was 0.9, 1.1, 1.5: kills at 0.9 and 1.1 fired at 0.79-1.07 avail. Undo: ram=0.9): 1.5 killed healthy LFM2 fits at 1.2-1.5 avail. Undo: ram=1.5
     # RAM 0.4 (was 1.0): the 35B hybrid model idles at only 1.1-2.0 GiB available and a Hermes prefill dips to ~0.65, so 1.0
     # killed healthy runs 20+ times on 2026-11-08 (commit free was ~11 GiB and the sampler never stalled). Undo: ram=1.0, samples=3.
     # soft=1.0/page_in=2000: below 1.0 GiB available RAM only counts as a breach while the box is also paging in (>2000 pages/s,
@@ -131,9 +131,17 @@ def resolve_unclean():
         jwrite(ev="end", name=cur["name"], how="clean restart (not blamed)")
 
 
+SHARED_GIB = 0.0  # latest Shared Usage of the GPU adapters (GiB), set by sample_stream
+
+
 def sample_stream(si=1):
     """Yield (used dedicated VRAM bytes of the busiest adapter, available RAM GiB, free commit GiB, pages read in/s) every si s."""
-    p = subprocess.Popen(["typeperf", r"\GPU Adapter Memory(*)\Dedicated Usage", r"\Memory\Available MBytes",
+    # 2026-11-14: also reads Shared Usage (GPU memory spilled to RAM) into SHARED_GIB for the journal only; no floor uses it.
+    # The 11/08 hard lock happened at 0.35 GiB free, above the 0.2 floor, so the next freeze should show whether spill led it.
+    # Undo: restore gpu-guard.py.bak-20261114-benchsafe.
+    global SHARED_GIB
+    p = subprocess.Popen(["typeperf", r"\GPU Adapter Memory(*)\Dedicated Usage", r"\GPU Adapter Memory(*)\Shared Usage",
+                          r"\Memory\Available MBytes",
                           r"\Memory\Committed Bytes", r"\Memory\Commit Limit", r"\Memory\Pages Input/sec", "-si", str(si)],
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                          creationflags=NOWIN)
@@ -146,10 +154,15 @@ def sample_stream(si=1):
             row = next(csv.reader([line]))
             if hdr is None:
                 hdr = row
-                gi = [i for i, h in enumerate(hdr) if "GPU Adapter Memory" in h]
+                gi = [i for i, h in enumerate(hdr) if "GPU Adapter Memory" in h and h.endswith("Dedicated Usage")]
+                shi = [i for i, h in enumerate(hdr) if "GPU Adapter Memory" in h and h.endswith("Shared Usage")]
                 ai, ci, li, pi = (next(i for i, h in enumerate(hdr) if h.endswith(s))
                                   for s in ("Available MBytes", "Committed Bytes", "Commit Limit", "Pages Input/sec"))
                 continue
+            try:
+                SHARED_GIB = max([float(row[i]) for i in shi if row[i].strip()] or [0.0]) / GIB
+            except ValueError:
+                pass
             try:
                 yield (max(float(row[i]) for i in gi if row[i].strip()), float(row[ai]) / 1024,
                        (float(row[li]) - float(row[ci])) / GIB, float(row[pi]))
@@ -220,7 +233,7 @@ def ft_gpu_pids(match):
             pass
     me = os.getpid()
     js = ps("Get-CimInstance Win32_Process | ? { $_.CommandLine } | "
-            "select ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress")
+            "select ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress")
     procs = json.loads(js or "[]")
     procs = procs if isinstance(procs, list) else [procs]
     # 2026-11-07: ft serve's engine runs in a multiprocessing child whose command line has no "freetoken" in it
@@ -231,6 +244,10 @@ def ft_gpu_pids(match):
         ok |= {p["ProcessId"] for p in procs if p["ParentProcessId"] in ok}
     hits = []
     for p in procs:
+        # 2026-11-14: only a Python process (or ft.exe) is stopped, so an editor or the desktop app that has "freetoken" in
+        # its command line and holds some VRAM itself is left alone. Undo: drop the Name test.
+        if not str(p.get("Name") or "").lower().startswith(("python", "ft.exe")):
+            continue
         if p["ProcessId"] in ok and p["ProcessId"] != me and used.get(p["ProcessId"], 0) > 0:
             hits.append((p["ProcessId"], used[p["ProcessId"]]))
     return hits
@@ -271,8 +288,18 @@ def note_stop(name, why, pids=None):
     return tip
 
 
+_LAST_BREACH = 0.0
+
+
 def kill_ft(match, name, why):
     hits = ft_gpu_pids(match)
+    if not hits:  # 2026-11-14: a floor was breached but no FreeToken process holds VRAM: say so, don't claim a kill
+        global _LAST_BREACH
+        if time.time() - _LAST_BREACH >= 60:
+            _LAST_BREACH = time.time()
+            jwrite(ev="breach", name=name, why=why, note="no FreeToken GPU process to stop")
+            print(f"[gpu-guard] breach '{name}': {why}; no FreeToken GPU process to stop", flush=True)
+        return False
     tip = kill_hint(why)
     jwrite(ev="kill", name=name, why=why, pids=[h[0] for h in hits], **({"tip": tip} if tip else {}))
     print(f"[gpu-guard] KILL '{name}': {why}; pids {[h[0] for h in hits]}", flush=True)
@@ -287,10 +314,12 @@ def jsample(name, a, lastw, used, avail, cfree, now, pin=0.0):
     """Journal a sample when it moved, every 10 s, or near a floor (fsynced, survives a hard reset)."""
     used_g, free = used / GIB, a.total_gib - used / GIB
     near = free < a.min_free_gib + 1 or avail < max(a.min_ram_gib, a.soft_ram_gib) + 2 or cfree < a.min_commit_gib + 2
-    if abs(used_g - lastw[0]) > 0.05 or abs(avail - lastw[2]) > 0.5 or now - lastw[1] >= 10 or near:
+    sh = SHARED_GIB
+    moved_sh = abs(sh - (lastw[3] if len(lastw) > 3 else 0.0)) > 0.1
+    if abs(used_g - lastw[0]) > 0.05 or abs(avail - lastw[2]) > 0.5 or now - lastw[1] >= 10 or near or moved_sh:
         jwrite(ev="vram", name=name, used_gib=round(used_g, 2), free_gib=round(free, 2),
-               ram_gib=round(avail, 2), commit_gib=round(cfree, 2), pagein=round(pin))
-        return (used_g, now, avail)
+               ram_gib=round(avail, 2), commit_gib=round(cfree, 2), pagein=round(pin), shared_gib=round(sh, 2))
+        return (used_g, now, avail, sh)
     return lastw
 
 
@@ -318,6 +347,8 @@ def apply_profile(a, prof, explicit=()):
     p = PROFILES[prof]
     a.min_free_gib, a.min_ram_gib, a.min_commit_gib, a.samples = p["free"], p["ram"], p["commit"], p["samples"]
     a.soft_ram_gib, a.page_in = p["soft"], p["page_in"]
+    for k, v in (explicit or getattr(a, "explicit", {})).items():  # 2026-11-14: floors set by flag or env outlive a switch
+        setattr(a, k, v)
     a.profile = prof
 
 
@@ -386,6 +417,10 @@ def main():
     ap.add_argument("--timeout", type=int, default=0, help="wrap mode: seconds, 0 = none")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
+    # 2026-11-14: values that differ from the start profile came from a flag or env; apply_profile() keeps them
+    a.explicit = {k: getattr(a, k) for k, pk in (("min_free_gib", "free"), ("min_ram_gib", "ram"), ("min_commit_gib", "commit"),
+                                                  ("samples", "samples"), ("soft_ram_gib", "soft"), ("page_in", "page_in"))
+                  if getattr(a, k) != prof[pk]}
 
     if a.clear:
         k = killers(); k.pop(a.clear, None); save_killers(k); print("cleared", a.clear); return
@@ -413,7 +448,7 @@ def main():
         print(f"[gpu-guard] killing leftover processes {old} ('{a.stale}')", flush=True)
         jwrite(ev="kill", name=a.name, why="leftover before run", pids=old)
         kill_pids(old)
-        print(f"[gpu-guard] leftovers gone in {wait_recovered(old, float("inf"), timeout=30)} s", flush=True)
+        print(f"[gpu-guard] leftovers gone in {wait_recovered(old, float('inf'), timeout=30)} s", flush=True)
     base = next(sample_stream())[0] / GIB
     prio = 0x00004000 if a.low_prio else 0  # BELOW_NORMAL_PRIORITY_CLASS (children inherit it, skews tok/s)
     proc = subprocess.Popen(cmd, creationflags=prio | 0x00000200)  # new process group

@@ -13,6 +13,8 @@ Tests (streamed, temp 0, thinking off):
   cN      (c2, c3, c4, ...) N concurrent requests at once, N different essay prompts, 512 tokens each; decode_tps is the
           TOTAL throughput (all generated tokens / wall time from first token to last token), per_req_tps the single streams
 Each test also keeps the [graph-stamps] lines it produced, when FREETOKEN_GRAPH_STAMPS is set.
+The decode warm-up (the first request, so the first replay of each graph) is kept as tests.decode_warm, and the
+graph.py probes are collected into res["probes"]: [alloc-probe] lines and [graph-upload] ok/failed counts (doc 27 A/B).
 Results: one JSON line per run in speedprobe\\results.jsonl next to this folder; server log in speedprobe\\NAME.log.
 """
 import argparse, json, os, random, re, subprocess, sys, threading, time, urllib.request
@@ -21,7 +23,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)
 OUT = os.path.join(SRC, "speedprobe")
 MODEL = "E:/ai-models/ft-models/HauhauCS_Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_NL.gguf"
-BASE_ENV = {"FREETOKEN_PIN_BUDGET_GB": "14", "FREETOKEN_BANK_CUDA_ALLOC": "1", "FT_GRAPH_MAX_BS": "1"}
+sys.path.insert(0, HERE)
+from ft_daemon_env import daemon_env  # 2026-11-14: the daemon launcher's env, not a fixed pin 14 / graph bs 1. Undo: *.bak-20261114-benchsafe
+BASE_ENV = daemon_env()
 BASE_ARGS = ["--moe-cpu-layers", "auto", "--moe-cache-size", "5000"]
 ESSAY = "Write a detailed 900-word essay on the history of the printing press."
 LOAD_RX = re.compile(r"Free memory|moe-cpu-layers|expert banks|CPU MoE executor|stream memops|max_total_num_tokens|context len|Free GPU memory after|slots|Load weight end|error|Error|Traceback")
@@ -258,8 +262,12 @@ def main():
         sys.exit(f"GPU busy: {busy}. Stop it first.")
     os.makedirs(OUT, exist_ok=True)
     logp = os.path.join(OUT, f"{a.name}.log")
-    env = dict(os.environ); env.update(BASE_ENV)
+    env = dict(os.environ)
+    for k, v in BASE_ENV.items():  # the caller's environment and --env win over the daemon's defaults
+        env.setdefault(k, v)
     extra_env = dict(kv.split("=", 1) for kv in a.env); env.update(extra_env)
+    base_env = {k: env[k] for k in BASE_ENV}
+    print(f"[{a.name}] base env (daemon launcher): {' '.join(f'{k}={v}' for k, v in base_env.items())}")
     extra = a.args.split() if a.args else []
     args = ([] if a.no_base_args else base_args_for(a.model, extra)) + extra
     if not a.vision and "--mm-disable" not in args:
@@ -272,7 +280,7 @@ def main():
     print(f"[{a.name}] env {extra_env or '-'}  args {' '.join(args)}")
     t0 = time.time(); logf = open(logp, "wb")
     p = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env, creationflags=0x200)  # new process group
-    res = {"name": a.name, "when": time.strftime("%Y-%m-%d %H:%M"), "env": extra_env, "args": args, "model": os.path.basename(a.model), "tests": {}}
+    res = {"name": a.name, "when": time.strftime("%Y-%m-%d %H:%M"), "env": extra_env, "base_env": base_env, "args": args, "model": os.path.basename(a.model), "tests": {}}
     try:
         while True:
             if p.poll() is not None:
@@ -288,6 +296,13 @@ def main():
         print(f"\r  ready in {res['load_s']}s")
         for l in res["load_lines"]:
             print("   ", l)
+        # 2026-11-14 doc 27 A/B probes (graph.py). Undo: *.bak-20261114-probes
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        up = re.findall(r"\[graph-upload\] (hipGraphUpload ok|.*)", plain)
+        res["probes"] = {"alloc": [l.strip()[:200] for l in re.findall(r"\[alloc-probe\][^\r\n]*", plain)],
+                         "upload_ok": sum(u == "hipGraphUpload ok" for u in up),
+                         "upload_other": [u.strip()[:200] for u in up if u != "hipGraphUpload ok"][:3]}
+        print(f"    probes: {res['probes']}")
         tests = [t for t in a.tests.split(",") if t]
         plan = {"decode": [(ESSAY, 512, "warm"), (ESSAY, 512, "run")]}
         for t in tests:  # pNk / pN: an N-thousand (or N) token prompt, then 256 tokens of decode at that depth
@@ -318,6 +333,8 @@ def main():
                 text, pos = log_tail(logp, pos)
                 r["stamps"] = stamps_of(text)[-3:]
                 print(f" prompt {r['prompt_tokens']} ttft {r['ttft_s']}s prefill {r['prefill_tps']} tok/s, decode {r['decode_tps']} tok/s ({r['gen_tokens']} tok)")
+                if kind == "warm" and t == "decode":
+                    res["tests"]["decode_warm"] = r  # first request: first replay of each graph (doc 27 B)
                 if kind == "run":
                     res["tests"][t] = r
                     for st in r["stamps"][-1:]:
