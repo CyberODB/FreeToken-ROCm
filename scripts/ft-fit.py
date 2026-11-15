@@ -56,6 +56,7 @@ GPU_RESET_PAT = re.compile(r"hipError|unspecified launch|device lost|DEVICE_LOST
 OOM_PAT = re.compile(r"out of memory|OutOfMemory", re.I)
 WER_QUEUE = r"C:\ProgramData\Microsoft\Windows\WER\ReportQueue"
 GPU_RESET_SETTLE_S, GPU_RESET_STOP = 20, 2
+RAM_SETTLE_S = 30  # after the guard stops a run on host RAM, before the next load (the bench waits the same)
 RESETS = {"n": 0}  # GPU resets seen by this fit, for write_out
 
 
@@ -539,6 +540,9 @@ def ladder(inv: dict, a) -> dict:
     def kv_short(r: dict) -> bool:
         return bool(r.get("kv_short"))  # the engine log says "Not enough memory for KV cache"
 
+    def ram_short(r: dict) -> bool:
+        return "available RAM" in str(r.get("error"))  # the guard stopped it on its host RAM floor
+
     if not inv.get("experts"):
         # A dense model: the engine ignores --moe-strategy and the expert cache, so fused/hybrid/ratio are one config.
         # What decides the KV room is memory-ratio x free VRAM minus the weights and the GDN state pool (4 slots per
@@ -581,6 +585,13 @@ def ladder(inv: dict, a) -> dict:
                 notes.append(f"{strat} at ratio {ratio:.2f} failed: {err(r)}")
                 if kv_short(r) and strat == "hybrid" and last is None:
                     continue  # hybrid starts at the lowest ratio: a higher one leaves more room for KV
+                if ram_short(r) and strat == "hybrid" and last is None and not r.get("gpu_reset"):
+                    # 2026-11-15: a higher ratio keeps more experts in VRAM, so fewer in host RAM (qwen38 IQ3_M: min RAM 3.23 GiB
+                    # at 0.80, 3.62 at 0.85). occamy IQ3_M stopped here at 0.80 with 0.52 GiB, 0.18 under the floor, and never
+                    # tried 0.85. Wait for the guard-freed RAM to come back first. Undo: delete this branch.
+                    print(f"      .. host RAM ran out at ratio {ratio:.2f}: waiting {RAM_SETTLE_S} s, then a higher ratio", flush=True)
+                    time.sleep(RAM_SETTLE_S)
+                    continue
                 break
             if best is None or better(r, best):
                 best = r
