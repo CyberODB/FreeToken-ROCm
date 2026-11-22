@@ -182,6 +182,16 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be positive")
         return size
 
+    def _parse_desktop_reserve(value: str) -> str:
+        text = value.strip().lower()
+        if text != "auto":
+            try:
+                if float(text) < 0:
+                    raise ValueError
+            except ValueError:
+                raise argparse.ArgumentTypeError("must be auto or a number of GiB >= 0") from None
+        return text
+
     def _parse_cache_split(value: str) -> str:
         if value == "equal" or (value.startswith("profile:") and len(value) > len("profile:")):
             return value
@@ -841,6 +851,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--desktop-reserve-gb",
+        type=_parse_desktop_reserve,
+        default=None,
+        help=(
+            "VRAM held back from every free-memory read so the plan does not spill into shared GPU memory: GiB, or "
+            "auto (the desktop's dedicated use at load + 0.5). Sets FREETOKEN_DESKTOP_RESERVE_GB for this server only."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-scope",
         choices=SCOPES,
         default=ServerArgs.moe_cache_scope,
@@ -1085,6 +1105,11 @@ def parse_args(
         if not is_gguf_path(kwargs["model_path"]):
             parser.error("--mmproj needs a .gguf model file")
         os.environ[MMPROJ_ENV] = os.path.abspath(os.path.expanduser(mmproj))
+
+    # ROCm fork 2026-11-22: a per-server desktop reserve, so one card can take it without the daemon-wide env.
+    # engine.py reads FREETOKEN_DESKTOP_RESERVE_GB in every process, so it travels in the environment like --mmproj.
+    if (reserve := kwargs.pop("desktop_reserve_gb")) is not None:
+        os.environ["FREETOKEN_DESKTOP_RESERVE_GB"] = reserve
 
     # a bad media root is a deployment mistake; fail at startup, not per request
     if kwargs["allowed_local_media_path"]:
